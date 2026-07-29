@@ -21,7 +21,7 @@ automatically, and anything unknown degrades to a guided manual mode.
 python heat_source_discovery.py
 ```
 
-## The five-tab flow
+## The tab flow
 
 1. **Instrument** — enter the Make and Serial number (required; the sheet
    records which physical unit the values were verified on). Model, serial,
@@ -45,6 +45,31 @@ python heat_source_discovery.py
    heat-source-side checklist tailored to the protocol family, and the
    286-side steps. Save as .txt or copy to clipboard. Profiles persist to
    `heat_source_profiles.json` for the library sidebar.
+6. **Control** — drive the heat source with plain values instead of syntax.
+   Pick a profile from the dropdown (saved, quick-picked, or freshly
+   discovered), connect with its own settings, type `20` in the set-point
+   field and press Send — the profile supplies the command. It reads the
+   value back and says whether it took. Buttons read the set point,
+   temperature, and unit; a quiet auto-read refreshes every 2 s without
+   filling the log.
+
+### Control tab guardrails
+
+Because this tab actually drives the well, it behaves conservatively:
+
+- **Out-of-range values are refused, never clamped.** Entering 600 on a
+  −45…140 °C profile sends nothing and tells you why. If a profile has no
+  range set, it asks once before sending.
+- **Sending a set point never starts heating.** Output enable is a separate
+  button with a confirmation prompt, because on most of this gear the output
+  resets to off at power-up and must be turned on deliberately.
+- **STOP always works**, including while another command is in flight, and
+  never asks for confirmation.
+- **Readback is the proof.** Every set point is read back and compared; if
+  it didn't change, the log names the likely cause (usually a protected set
+  point) and the fix. Tick "Send password first" for locked Fluke units.
+- Profiles with no enable command (the classic Micro-Baths) say so plainly
+  and point you to the front panel rather than sending a guess.
 
 ## Notes and limits worth knowing
 

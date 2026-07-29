@@ -36,6 +36,16 @@ reply captured for each verified command, and a per-family checklist for the
 heat-source side. Save as .txt or copy to the clipboard. Profiles persist to
 a JSON library.
 
+Control tab
+-----------
+Pick a saved profile and drive the heat source with plain values instead of
+syntax: type 20 in the set-point field, press Send, and the profile's format
+supplies the command. Reads the set point back to confirm, reads block
+temperature and unit on demand, offers a quiet 2-second auto-read, and keeps
+heating/cooling output as a separate, confirmed action. Set points outside
+the profile's range are refused rather than silently clamped, and STOP works
+even while another command is in flight.
+
 Safety
 ------
 * Discovery probes are read-only queries.
@@ -109,6 +119,7 @@ FAMILIES = {
         },
         "value_alts": ["SOUR:SENS:DATA?"],
         "enable": "OUTP:STAT 1",
+        "disable": "OUTP:STAT 0",
         "password": "SYST:PASS:CEN 1234",
         "checklist": [
             "ECHO Off in the COMM menu (echo breaks the ADT286 parser)",
@@ -129,6 +140,7 @@ FAMILIES = {
         },
         "value_alts": ["SOUR:SENS:DAT? TEMP"],
         "enable": "OUTP:STAT 1",
+        "disable": "OUTP:STAT 0",
         "password": "SYST:PASS:CEN 1234",
         "checklist": [
             "Temperature control (OUTP:STAT) is OFF after power-up and *RST "
@@ -309,6 +321,7 @@ class SerialLink:
         self.log = log_fn                  # callable(tag, text)
         self.terminator = "\r\n"
         self.reply_timeout = 1.0
+        self.silent = False                # suppress TX/RX logging (monitor)
 
     @property
     def is_open(self):
@@ -372,7 +385,8 @@ class SerialLink:
         if not self.is_open:
             raise RuntimeError("Port is not open.")
         tgt = log_target or "discover"
-        self.log("TX", repr(cmd + self.terminator), tgt)
+        if not self.silent:
+            self.log("TX", repr(cmd + self.terminator), tgt)
         if not expect_reply:
             self.ser.reset_input_buffer()
             self.ser.write((cmd + self.terminator).encode("ascii",
@@ -380,13 +394,14 @@ class SerialLink:
             self.ser.flush()
             time.sleep(0.15)
             junk = self.ser.read(self.ser.in_waiting or 0)
-            if junk:
+            if junk and not self.silent:
                 self.log("RX", repr(junk.decode("ascii", errors="replace")),
                          tgt)
             return []
         raw = self.raw_exchange(cmd, self.reply_timeout)
         text = raw.decode("ascii", errors="replace")
-        self.log("RX", repr(text) if text else "<no response>", tgt)
+        if not self.silent:
+            self.log("RX", repr(text) if text else "<no response>", tgt)
         return [ln.strip() for ln in re.split(r"[\r\n]+", text) if ln.strip()]
 
     def query(self, cmd, log_target=None):
@@ -418,6 +433,8 @@ class App(tk.Tk):
 
         # Discovery session state
         self.session = self._blank_session()
+        self.monitor_stop = threading.Event()
+        self.monitor_thread = None
 
         self._build_ui()
         self._refresh_ports()
@@ -438,7 +455,7 @@ class App(tk.Tk):
             "port": "", "baud": "", "terminator_name": "", "echo": False,
             "idn": "", "classic_reply": "", "family": "", "kind": "",
             "sp_read": "", "sp_write": "", "value": "", "unit": "",
-            "enable": "", "password": "",
+            "enable": "", "disable": "", "password": "",
             "unit_token": "",
             "evidence": {},           # field -> (command, sample reply)
             "sp_write_verified": False,
@@ -638,7 +655,96 @@ class App(tk.Tk):
                                                    font=("Consolas", 10))
         self.txt_sheet.pack(fill="both", expand=True, padx=8, pady=6)
 
-        # --- Tab 6: Terminal --------------------------------------------------
+        # --- Tab 6: Control ---------------------------------------------------
+        t6c = ttk.Frame(self.nb)
+        self.nb.add(t6c, text=" 6 · Control ")
+
+        prow = ttk.LabelFrame(t6c, text="Active profile")
+        prow.pack(fill="x", padx=8, pady=8)
+        self.var_ctl_profile = tk.StringVar()
+        self.cbo_ctl_profile = ttk.Combobox(prow,
+                                            textvariable=self.var_ctl_profile,
+                                            width=46, state="readonly")
+        self.cbo_ctl_profile.grid(row=0, column=0, padx=6, pady=4, sticky="w")
+        self.cbo_ctl_profile.bind("<<ComboboxSelected>>",
+                                  self._on_ctl_profile)
+        ttk.Button(prow, text="Connect with profile settings",
+                   command=self._ctl_connect).grid(row=0, column=1, padx=6)
+        ttk.Label(prow, foreground="#555",
+                  text="Uses the COM port selected on tab 2. Commands come "
+                       "from the Review tab, so a saved profile, quick-pick, "
+                       "or fresh discovery all work here.").grid(
+            row=1, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+
+        act = ttk.LabelFrame(t6c, text="Controls — enter values, no syntax "
+                                       "needed")
+        act.pack(fill="x", padx=8, pady=4)
+        cpad = {"padx": 6, "pady": 4}
+
+        ttk.Label(act, text="Set point").grid(row=0, column=0, sticky="e",
+                                              **cpad)
+        self.var_ctl_sp = tk.StringVar(value="20")
+        self.var_ctl_sp_now = tk.StringVar(value="—")
+        self.var_ctl_pw = tk.BooleanVar(value=False)
+        ttk.Entry(act, textvariable=self.var_ctl_sp, width=10).grid(
+            row=0, column=1, sticky="w", **cpad)
+        ttk.Button(act, text="Send set point",
+                   command=self._ctl_set_setpoint).grid(row=0, column=2,
+                                                        **cpad)
+        ttk.Button(act, text="Read set point",
+                   command=lambda: self._ctl_read(
+                       "sp_read", self.var_ctl_sp_now)).grid(row=0, column=3,
+                                                             **cpad)
+        ttk.Label(act, textvariable=self.var_ctl_sp_now, width=12).grid(
+            row=0, column=4, **cpad)
+        ttk.Checkbutton(act, text="Send password first",
+                        variable=self.var_ctl_pw).grid(row=0, column=5,
+                                                       **cpad)
+
+        ttk.Label(act, text="Temperature").grid(row=1, column=0, sticky="e",
+                                                **cpad)
+        self.var_ctl_temp = tk.StringVar(value="—")
+        self.var_ctl_poll = tk.BooleanVar(value=False)
+        ttk.Label(act, textvariable=self.var_ctl_temp, width=10,
+                  font=("TkDefaultFont", 12, "bold")).grid(
+            row=1, column=1, sticky="w", **cpad)
+        ttk.Button(act, text="Read temperature",
+                   command=lambda: self._ctl_read(
+                       "value", self.var_ctl_temp)).grid(row=1, column=2,
+                                                         **cpad)
+        ttk.Checkbutton(act, text="Auto-read every 2 s (quiet)",
+                        variable=self.var_ctl_poll,
+                        command=self._ctl_toggle_poll).grid(
+            row=1, column=3, columnspan=2, sticky="w", **cpad)
+
+        ttk.Label(act, text="Unit").grid(row=2, column=0, sticky="e", **cpad)
+        self.var_ctl_unit = tk.StringVar(value="—")
+        ttk.Label(act, textvariable=self.var_ctl_unit, width=10).grid(
+            row=2, column=1, sticky="w", **cpad)
+        ttk.Button(act, text="Read unit",
+                   command=lambda: self._ctl_read(
+                       "unit", self.var_ctl_unit, numeric=False)).grid(
+            row=2, column=2, **cpad)
+
+        ttk.Label(act, text="Heat/cool output").grid(row=3, column=0,
+                                                     sticky="e", **cpad)
+        ttk.Button(act, text="Enable",
+                   command=lambda: self._ctl_output(True)).grid(
+            row=3, column=1, sticky="w", **cpad)
+        ttk.Button(act, text="Disable",
+                   command=lambda: self._ctl_output(False)).grid(
+            row=3, column=2, sticky="w", **cpad)
+        ttk.Label(act, foreground="#9a6700",
+                  text="Enable makes the instrument actively heat or cool "
+                       "toward the set point.").grid(
+            row=3, column=3, columnspan=3, sticky="w", **cpad)
+
+        self.log_control = scrolledtext.ScrolledText(t6c, height=12,
+                                                     wrap="word")
+        self.log_control.pack(fill="both", expand=True, padx=8, pady=6)
+        self._style_log(self.log_control)
+
+        # --- Tab 7: Terminal --------------------------------------------------
         t6 = ttk.Frame(self.nb)
         self.nb.add(t6, text=" Terminal ")
         tb = ttk.Frame(t6)
@@ -678,7 +784,8 @@ class App(tk.Tk):
             while True:
                 target, tag, text = self.log_queue.get_nowait()
                 widget = {"connect": self.log_connect,
-                          "terminal": self.log_terminal}.get(
+                          "terminal": self.log_terminal,
+                          "control": self.log_control}.get(
                               target, self.log_discover)
                 widget.configure(state="normal")
                 widget.insert("end", f"[{tag}] {text}\n", tag)
@@ -716,6 +823,19 @@ class App(tk.Tk):
             self.lst_profiles.insert(
                 "end", f"{p.get('make','?')} {p.get('model','')} "
                        f"SN {p.get('sn','?')}{mark}")
+        self._refresh_control_profiles()
+
+    def _profile_label(self, p):
+        mark = " [verified]" if p.get("sp_write_verified") else ""
+        return (f"{p.get('make','?')} {p.get('model','')} "
+                f"SN {p.get('sn','?')}{mark}")
+
+    def _refresh_control_profiles(self):
+        labels = ["(current values on tabs 1 & 4)"]
+        labels += [self._profile_label(p) for p in self.profiles]
+        self.cbo_ctl_profile["values"] = labels
+        if self.var_ctl_profile.get() not in labels:
+            self.var_ctl_profile.set(labels[0])
 
     def _current_profile(self):
         p = {
@@ -728,7 +848,8 @@ class App(tk.Tk):
         }
         p.update({k: v.get().strip() for k, v in self.rev_vars.items()})
         for key in ("port", "baud", "echo", "idn", "family", "kind",
-                    "evidence", "sp_write_verified", "verified_at"):
+                    "disable", "evidence", "sp_write_verified",
+                    "verified_at"):
             p[key] = self.session.get(key)
         return p
 
@@ -742,8 +863,9 @@ class App(tk.Tk):
         for k, var in self.rev_vars.items():
             var.set(p.get(k, ""))
         self.session = self._blank_session()
-        for key in ("idn", "family", "kind", "evidence", "sp_write_verified",
-                    "verified_at", "baud", "port", "echo"):
+        for key in ("idn", "family", "kind", "disable", "evidence",
+                    "sp_write_verified", "verified_at", "baud", "port",
+                    "echo"):
             if key in p:
                 self.session[key] = p[key]
         self.session["terminator_name"] = p.get("terminator_name", "")
@@ -792,6 +914,7 @@ class App(tk.Tk):
         return raw.split(" — ")[0].strip() if raw else ""
 
     def _disconnect(self):
+        self._ctl_stop_poll()
         with self.serial_lock:
             self.link.close()
         self.lbl_conn.configure(text="Not connected", foreground="#b00020")
@@ -802,6 +925,7 @@ class App(tk.Tk):
             messagebox.showerror("Connect", "Pick a COM port first.")
             return
         try:
+            self._ctl_stop_poll()
             with self.serial_lock:
                 self.link.open(port, self.var_mbaud.get(),
                                TERMINATORS[self.var_mterm.get()],
@@ -966,7 +1090,9 @@ class App(tk.Tk):
                          ("enable", fam.get("enable", "")),
                          ("password", fam.get("password", ""))):
             s[key] = val
-            self.rev_vars[key].set(val)
+            if key in self.rev_vars:
+                self.rev_vars[key].set(val)
+        s["disable"] = fam.get("disable", "")
         s["sp_write_verified"] = False
         self._log_ts("INFO", f"Pre-loaded format: {make} {token} — "
                              f"{fam['label']}. Connect (tab 2) and run "
@@ -1147,6 +1273,7 @@ class App(tk.Tk):
 
                 # Family extras & wrap-up --------------------------------
                 s["enable"] = fam.get("enable", "")
+                s["disable"] = fam.get("disable", "")
                 s["password"] = fam.get("password", "")
                 s["verified_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
                 self.after(0, self._push_session_to_review)
@@ -1174,6 +1301,329 @@ class App(tk.Tk):
         for key in ("terminator_name", "sp_write", "sp_read", "value",
                     "unit", "unit_token", "enable", "password"):
             self.rev_vars[key].set(s.get(key, "") or "")
+
+    # ----------------------------------------------------------- control ---
+    def _log_ctl(self, tag, text):
+        self._log_ts(tag, text, "control")
+
+    def _on_ctl_profile(self, _e=None):
+        idx = self.cbo_ctl_profile.current()
+        if idx > 0:
+            self._ctl_stop_poll()
+            self._apply_profile(self.profiles[idx - 1])
+        self._ctl_describe_active()
+
+    def _ctl_describe_active(self):
+        """Log exactly what the buttons will send, so nothing is a mystery."""
+        make = self.var_make.get().strip() or "(unnamed)"
+        model = self.var_model.get().strip()
+        sn = self.var_sn.get().strip()
+        unit = self.var_runit.get()
+        lo, hi = self.var_rmin.get().strip(), self.var_rmax.get().strip()
+        fam = FAMILIES.get(self.session.get("family") or "unknown")
+        self._log_ctl("STEP", f"Active: {make} {model}"
+                              + (f" SN {sn}" if sn else "")
+                              + f" — {fam['label']}")
+        write = self.rev_vars["sp_write"].get().strip() or "(none)"
+        self._log_ctl("INFO", f"Set point will be sent as: {write}"
+                              + (f"   |   allowed range {lo} to {hi} {unit}"
+                                 if lo and hi else
+                                 "   |   range not set (no limit check)"))
+        en = self.rev_vars["enable"].get().strip()
+        dis = self.session.get("disable") or ""
+        self._log_ctl("INFO", f"Output enable: {en or '(front panel only)'}"
+                              f"   |   stop: {dis or '(front panel only)'}")
+        if not self.session.get("sp_write_verified"):
+            self._log_ctl("WARN", "This profile's write command has not been "
+                                  "verified against the instrument. Run "
+                                  "Discover (tab 3), or read the set point "
+                                  "back after sending.")
+
+    def _ctl_connect(self):
+        port = self._selected_port()
+        if not SERIAL_OK or not port:
+            messagebox.showerror("Connect",
+                                 "Pick a COM port on tab 2 first, then use "
+                                 "Refresh if the list is empty.")
+            return
+        tname = self.rev_vars["terminator_name"].get().strip() or "CRLF"
+        if tname not in TERMINATORS:
+            self._log_ctl("WARN", f"Terminator {tname!r} is not recognized; "
+                                  "using CRLF.")
+            tname = "CRLF"
+        baud = str(self.session.get("baud") or "").strip()
+        if not baud:
+            baud = "9600"
+            self._log_ctl("WARN", "This profile has no stored baud rate; "
+                                  "trying 9600. If it does not answer, "
+                                  "auto-detect on tab 2.")
+        self._ctl_stop_poll()
+        try:
+            with self.serial_lock:
+                self.link.open(port, baud, TERMINATORS[tname],
+                               reply_timeout=1.0)
+            self.session["port"] = port
+            self.session["baud"] = baud
+            self.session["terminator_name"] = tname
+            self.lbl_conn.configure(
+                text=f"Connected: {port} @ {baud} {tname}",
+                foreground="#1a7f37")
+            self._log_ctl("PASS", f"Connected on {port} @ {baud} baud, "
+                                  f"terminator {tname}.")
+            self._ctl_describe_active()
+        except Exception as e:
+            messagebox.showerror("Connect", f"Could not open {port}:\n{e}")
+
+    def _ctl_run(self, job, allow_busy=False):
+        """Run a serial job on a worker thread with UI guards."""
+        if not self.link.is_open:
+            messagebox.showerror(
+                "Not connected",
+                "Connect first — use 'Connect with profile settings' on this "
+                "tab, or auto-detect on tab 2.")
+            return
+        if self.busy and not allow_busy:
+            messagebox.showinfo("Busy",
+                                "Another operation is running. Wait for it to "
+                                "finish, then try again.")
+            return
+
+        def worker():
+            if not allow_busy:
+                self.busy = True
+            try:
+                with self.serial_lock:
+                    job()
+            except Exception as e:
+                self._log_ctl("FAIL", f"Command failed: {e}")
+            finally:
+                if not allow_busy:
+                    self.busy = False
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _ctl_read(self, key, var, numeric=True):
+        labels = {"sp_read": "set-point reading", "value": "value",
+                  "unit": "unit reading"}
+        cmd = self.rev_vars[key].get().strip()
+        if not cmd:
+            messagebox.showerror(
+                "Command not available",
+                f"This profile has no {labels.get(key, key)} command. Add it "
+                "on the Review tab, or run Discover to find it.")
+            return
+
+        def job():
+            lines, echo = self.link.query(cmd, log_target="control")
+            raw = lines[0] if lines else ""
+            if echo:
+                self._log_ctl("WARN", "The instrument echoed the command — "
+                                      "turn echo off on the instrument.")
+            if not raw:
+                self.after(0, lambda: var.set("no reply"))
+                self._log_ctl("FAIL", f"No reply to {cmd!r}. Check the "
+                                      "connection and that this command is "
+                                      "correct for this instrument.")
+                return
+            if numeric:
+                v = first_float(raw)
+                if v is None:
+                    self.after(0, lambda: var.set("unreadable"))
+                    self._log_ctl("FAIL", f"Reply {raw!r} has no number in "
+                                          "it.")
+                    return
+                unit = self.var_runit.get()
+                self.after(0, lambda t=f"{v:g} {unit}": var.set(t))
+                self._log_ctl("PASS", f"{labels.get(key, key).capitalize()}: "
+                                      f"{v:g} {unit}")
+            else:
+                tok = clean_token(raw)
+                self.after(0, lambda t=tok or "?": var.set(t))
+                self._log_ctl("PASS", f"Unit token {tok!r} — "
+                                      f"{suggest_unit_mapping(tok)}")
+                self.session["unit_token"] = tok
+                self.after(0, lambda: self.rev_vars["unit_token"].set(tok))
+        self._ctl_run(job)
+
+    def _ctl_set_setpoint(self):
+        tmpl = self.rev_vars["sp_write"].get().strip()
+        if not tmpl:
+            messagebox.showerror(
+                "Command not available",
+                "This profile has no set-point writing command. Add it on the "
+                "Review tab, or run Discover to find it.")
+            return
+        if "{value}" not in tmpl:
+            messagebox.showerror(
+                "Set-point command needs a placeholder",
+                "The writing command must contain {value} where the number "
+                f"goes.\n\nIt is currently:\n    {tmpl}\n\nFor example:\n"
+                "    SOUR:SPO {value}")
+            return
+        text = self.var_ctl_sp.get().strip().replace(",", ".")
+        try:
+            val = float(text)
+        except ValueError:
+            messagebox.showerror("Enter a number",
+                                 f"'{text}' is not a number. Type a plain "
+                                 "value such as 20 or -12.5.")
+            return
+
+        unit = self.var_runit.get()
+        lo_s, hi_s = self.var_rmin.get().strip(), self.var_rmax.get().strip()
+        try:
+            lo, hi = float(lo_s), float(hi_s)
+        except ValueError:
+            if not messagebox.askyesno(
+                    "Range not set",
+                    f"This profile has no temperature range, so {val:g} "
+                    f"{unit} cannot be checked against the instrument's "
+                    "limits.\n\nSend it anyway?"):
+                return
+        else:
+            if not (lo <= val <= hi):
+                messagebox.showerror(
+                    "Outside the instrument's range",
+                    f"{val:g} {unit} is outside this profile's range of "
+                    f"{lo:g} to {hi:g} {unit}.\n\nNothing was sent. Enter a "
+                    "value inside the range, or correct the range on tab 1 "
+                    "if it is wrong.")
+                self._log_ctl("FAIL", f"Refused {val:g} {unit} — outside "
+                                      f"range {lo:g} to {hi:g} {unit}. "
+                                      "Nothing sent.")
+                return
+
+        write_cmd = tmpl.replace("{value}", f"{val:.2f}")
+        read_cmd = self.rev_vars["sp_read"].get().strip()
+        pw = self.rev_vars["password"].get().strip()
+        send_pw = bool(self.var_ctl_pw.get() and pw)
+
+        def job():
+            if send_pw:
+                self._log_ctl("INFO", "Sending password command first.")
+                self.link.send(pw, expect_reply=False, log_target="control")
+            self.link.send(write_cmd, expect_reply=False,
+                           log_target="control")
+            self._log_ctl("INFO", f"Sent set point {val:.2f} {unit}.")
+            if not read_cmd:
+                self._log_ctl("WARN", "No set-point reading command in this "
+                                      "profile, so the value could not be "
+                                      "confirmed.")
+                return
+            time.sleep(0.3)
+            lines, _ = self.link.query(read_cmd, log_target="control")
+            rb = first_float(lines[0]) if lines else None
+            if rb is None:
+                self._log_ctl("FAIL", "No readback — cannot confirm the set "
+                                      "point changed.")
+                return
+            self.after(0, lambda t=f"{rb:g} {unit}":
+                       self.var_ctl_sp_now.set(t))
+            if abs(rb - val) <= 0.05:
+                self._log_ctl("PASS", f"Confirmed: set point is now {rb:g} "
+                                      f"{unit}.")
+            else:
+                self._log_ctl("FAIL", f"Set point reads {rb:g} {unit}, not "
+                                      f"{val:g}. If it did not change at all, "
+                                      "the set point is probably protected — "
+                                      "tick 'Send password first', or check "
+                                      "the instrument's lock setting.")
+        self._ctl_run(job)
+
+    def _ctl_output(self, enable):
+        if enable:
+            cmd = self.rev_vars["enable"].get().strip()
+        else:
+            cmd = (self.session.get("disable") or "").strip()
+        if not cmd:
+            messagebox.showinfo(
+                "No output command for this profile",
+                ("This profile has no output " +
+                 ("enable" if enable else "disable") +
+                 " command, so heating and cooling must be switched "
+                 f"{'on' if enable else 'off'} on the instrument's front "
+                 "panel."))
+            return
+        if enable:
+            sp = self.var_ctl_sp_now.get()
+            if not messagebox.askyesno(
+                    "Enable heating and cooling?",
+                    f"The instrument will start driving toward its set point "
+                    f"({sp}).\n\nMake sure probes are inserted correctly and "
+                    "the set point is what you intend.\n\nEnable output now?"):
+                return
+
+        def job():
+            self.link.send(cmd, expect_reply=False, log_target="control")
+            if enable:
+                self._log_ctl("PASS", "Output enabled — the instrument is "
+                                      "now heating or cooling toward the set "
+                                      "point.")
+            else:
+                self._log_ctl("PASS", "Output disabled — heating and cooling "
+                                      "stopped.")
+        # Stop must work even while another command is in flight.
+        self._ctl_run(job, allow_busy=not enable)
+
+    def _ctl_toggle_poll(self):
+        if not self.var_ctl_poll.get():
+            self._ctl_stop_poll()
+            return
+        if not self.link.is_open:
+            self.var_ctl_poll.set(False)
+            messagebox.showerror("Not connected",
+                                 "Connect before turning on auto-read.")
+            return
+        if not self.rev_vars["value"].get().strip():
+            self.var_ctl_poll.set(False)
+            messagebox.showerror(
+                "Command not available",
+                "This profile has no value command, so there is nothing to "
+                "read. Add it on the Review tab, or run Discover.")
+            return
+        self.monitor_stop.clear()
+        self.monitor_thread = threading.Thread(target=self._monitor_loop,
+                                               daemon=True)
+        self.monitor_thread.start()
+        self._log_ctl("INFO", "Auto-read on. Readings update the fields "
+                              "every 2 s without filling the log.")
+
+    def _ctl_stop_poll(self):
+        was_on = self.monitor_thread is not None
+        self.monitor_stop.set()
+        self.monitor_thread = None
+        if self.var_ctl_poll.get():
+            self.var_ctl_poll.set(False)
+        if was_on:
+            self._log_ctl("INFO", "Auto-read off.")
+
+    def _monitor_loop(self):
+        while not self.monitor_stop.is_set():
+            value_cmd = self.rev_vars["value"].get().strip()
+            sp_cmd = self.rev_vars["sp_read"].get().strip()
+            if self.link.is_open and self.serial_lock.acquire(blocking=False):
+                v = sp = None
+                try:
+                    self.link.silent = True
+                    lines, _ = self.link.query(value_cmd,
+                                               log_target="control")
+                    v = first_float(lines[0]) if lines else None
+                    if sp_cmd and not self.monitor_stop.is_set():
+                        slines, _ = self.link.query(sp_cmd,
+                                                    log_target="control")
+                        sp = first_float(slines[0]) if slines else None
+                except Exception:
+                    pass
+                finally:
+                    self.link.silent = False
+                    self.serial_lock.release()
+                unit = self.var_runit.get()
+                if v is not None:
+                    self.after(0, lambda t=f"{v:g} {unit}":
+                               self.var_ctl_temp.set(t))
+                if sp is not None:
+                    self.after(0, lambda t=f"{sp:g} {unit}":
+                               self.var_ctl_sp_now.set(t))
+            self.monitor_stop.wait(2.0)
 
     # ---------------------------------------------------------- terminal ---
     def _terminal_send(self):
@@ -1326,6 +1776,7 @@ class App(tk.Tk):
     # -------------------------------------------------------------- close --
     def _on_close(self):
         try:
+            self.monitor_stop.set()
             with self.serial_lock:
                 self.link.close(quiet=True)
         finally:
