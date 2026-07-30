@@ -16,7 +16,9 @@ from .engine import (ChannelRegistry, RunEngine, default_profile,
                      validate_profile, STATE_RUNNING)
 from .formats import KNOWN_MODELS, profile_for_model
 from .heatsource import HeatSource
-from .transport import SERIAL_OK, SERIAL_ERROR, available_ports
+from .transport import (CANDIDATE_TCP_PORTS, SERIAL_OK, SERIAL_ERROR,
+                        available_ports, describe_target, find_tcp_port,
+                        normalize_target, target_is_set)
 
 APP_TITLE = "Temperature Calibration Suite — ADT286 + heat sources"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -30,6 +32,176 @@ RUN_LIB = os.path.join(DATA_DIR, "calibration_profiles.json")
 
 PLOT_COLOURS = ["#0b5cad", "#b8500a", "#1a7f37", "#7a2fa8", "#b00020",
                 "#0f766e", "#8a6d00", "#4b5563"]
+
+
+
+# ------------------------------------------------------------ connections --
+KIND_LABELS = {
+    "serial": "USB / serial cable",
+    "bluetooth": "Bluetooth (paired SPP port)",
+    "tcp": "Network (Ethernet / Wi-Fi)",
+}
+LABEL_KINDS = {v: k for k, v in KIND_LABELS.items()}
+
+
+class ConnectionPicker(ttk.Frame):
+    """Chooses how to reach an instrument: cable, Bluetooth, or network."""
+
+    def __init__(self, master, on_log=None, **kw):
+        super().__init__(master, **kw)
+        self.on_log = on_log or (lambda tag, msg: None)
+        self.var_kind = tk.StringVar(value=KIND_LABELS["serial"])
+        self.var_port = tk.StringVar()
+        self.var_baud = tk.StringVar(value="9600")
+        self.var_host = tk.StringVar()
+        self.var_tcp = tk.StringVar(value="5025")
+        self.busy = False
+
+        ttk.Label(self, text="Connection").grid(row=0, column=0, sticky="e",
+                                                padx=4, pady=3)
+        ttk.Combobox(self, textvariable=self.var_kind, width=26,
+                     state="readonly",
+                     values=list(KIND_LABELS.values())).grid(
+            row=0, column=1, sticky="w", padx=4, pady=3)
+        self.var_kind.trace_add("write", lambda *a: self._sync())
+
+        self.row_serial = ttk.Frame(self)
+        self.row_serial.grid(row=1, column=0, columnspan=6, sticky="w")
+        ttk.Label(self.row_serial, text="Port").pack(side="left", padx=4)
+        self.cbo_port = ttk.Combobox(self.row_serial,
+                                     textvariable=self.var_port, width=34,
+                                     state="readonly")
+        self.cbo_port.pack(side="left", padx=4)
+        ttk.Button(self.row_serial, text="Refresh",
+                   command=self.refresh_ports).pack(side="left", padx=4)
+        ttk.Label(self.row_serial, text="Baud").pack(side="left", padx=(12, 2))
+        ttk.Combobox(self.row_serial, textvariable=self.var_baud, width=8,
+                     state="readonly",
+                     values=["1200", "2400", "4800", "9600", "19200", "38400",
+                             "57600", "115200"]).pack(side="left")
+
+        self.row_tcp = ttk.Frame(self)
+        self.row_tcp.grid(row=2, column=0, columnspan=6, sticky="w")
+        ttk.Label(self.row_tcp, text="Address").pack(side="left", padx=4)
+        ttk.Entry(self.row_tcp, textvariable=self.var_host,
+                  width=18).pack(side="left", padx=4)
+        ttk.Label(self.row_tcp, text="Port").pack(side="left", padx=(12, 2))
+        ttk.Entry(self.row_tcp, textvariable=self.var_tcp,
+                  width=8).pack(side="left")
+        ttk.Button(self.row_tcp, text="Find port",
+                   command=self.find_port).pack(side="left", padx=8)
+        self.lbl_hint = ttk.Label(self, text="", foreground="#555",
+                                  wraplength=620, justify="left")
+        self.lbl_hint.grid(row=3, column=0, columnspan=6, sticky="w", padx=6)
+        self.refresh_ports()
+        self._sync()
+
+    # -- state -------------------------------------------------------------
+    @property
+    def kind(self):
+        return LABEL_KINDS.get(self.var_kind.get(), "serial")
+
+    def _sync(self):
+        kind = self.kind
+        if kind == "tcp":
+            self.row_serial.grid_remove()
+            self.row_tcp.grid()
+            self.lbl_hint.configure(
+                text="Read the IP address off the instrument's network or "
+                     "Wi-Fi screen. If you do not know the socket port, press "
+                     "Find port and it will ask each likely port for its "
+                     "identity.")
+        else:
+            self.row_tcp.grid_remove()
+            self.row_serial.grid()
+            if kind == "bluetooth":
+                self.lbl_hint.configure(
+                    text="Pair the instrument in Windows Bluetooth settings "
+                         "first. Pairing creates an outgoing COM port — pick "
+                         "that port here. (Instruments that only speak "
+                         "Bluetooth Low Energy through Additel's app are not "
+                         "reachable this way; use Wi-Fi or Ethernet.)")
+            else:
+                self.lbl_hint.configure(
+                    text="For the ADT286 and Additel wells over USB, install "
+                         "Additel's USB driver so the instrument appears as a "
+                         "COM port.")
+
+    def refresh_ports(self):
+        vals = [f"{d} — {desc}" for d, desc in available_ports()]
+        self.cbo_port["values"] = vals
+        if vals and not self.var_port.get():
+            self.var_port.set(vals[0])
+
+    def get_target(self):
+        kind = self.kind
+        if kind == "tcp":
+            try:
+                port = int(str(self.var_tcp.get()).strip() or 5025)
+            except ValueError:
+                port = 5025
+            return {"kind": "tcp", "host": self.var_host.get().strip(),
+                    "tcp_port": port}
+        raw = self.var_port.get()
+        return {"kind": kind, "port": raw.split(" — ")[0].strip() if raw else "",
+                "baud": self.var_baud.get() or "9600"}
+
+    def set_target(self, target):
+        t = normalize_target(target)
+        self.var_kind.set(KIND_LABELS.get(t["kind"], KIND_LABELS["serial"]))
+        if t["kind"] == "tcp":
+            self.var_host.set(t.get("host", ""))
+            self.var_tcp.set(str(t.get("tcp_port", 5025)))
+        else:
+            if t.get("port"):
+                match = [v for v in (self.cbo_port["values"] or [])
+                         if v.startswith(t["port"])]
+                self.var_port.set(match[0] if match else t["port"])
+            self.var_baud.set(str(t.get("baud", "9600")))
+        self._sync()
+
+    # -- port discovery ----------------------------------------------------
+    def find_port(self):
+        host = self.var_host.get().strip()
+        if not host:
+            messagebox.showerror("Find port",
+                                 "Enter the instrument's IP address first.")
+            return
+        if self.busy:
+            return
+        self.busy = True
+        self.on_log("INFO", f"Asking {host} for its identity on "
+                            f"{len(CANDIDATE_TCP_PORTS)} likely ports…")
+
+        def work():
+            found = find_tcp_port(
+                host, progress=lambda p: self.on_log("INFO", f"  trying "
+                                                             f"{host}:{p}"))
+            self.after(0, lambda: self._found(host, found))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _found(self, host, found):
+        self.busy = False
+        if not found:
+            self.on_log("FAIL", f"No port on {host} answered *IDN?.")
+            messagebox.showerror(
+                "Nothing answered",
+                f"No likely port on {host} replied to *IDN?.\n\n"
+                "Check that the address is right and reachable (try pinging "
+                "it), that remote/socket communication is switched on in the "
+                "instrument's settings, and that a firewall is not blocking "
+                "the connection. If Additel support gives you the port "
+                "number, type it in directly.")
+            return
+        port, idn = found[0]
+        self.var_tcp.set(str(port))
+        self.on_log("PASS", f"{host}:{port} answered — {idn}")
+        extra = ("" if len(found) == 1 else
+                 f"\n\nOthers also answered: "
+                 + ", ".join(str(p) for p, _ in found[1:]))
+        messagebox.showinfo("Found it",
+                            f"{host}:{port} identifies as:\n\n{idn}\n\n"
+                            f"The port has been filled in." + extra)
 
 
 # ---------------------------------------------------------------- plotting --
@@ -251,36 +423,34 @@ class SuiteApp(tk.Tk):
 
         adt = ttk.LabelFrame(t, text="Additel ADT286 (USB)")
         adt.pack(fill="x", padx=8, pady=8)
-        ttk.Label(adt, text="Port").grid(row=0, column=0, **pad)
-        self.var_adt_port = tk.StringVar()
-        self.cbo_adt_port = ttk.Combobox(adt, textvariable=self.var_adt_port,
-                                         width=34, state="readonly")
-        self.cbo_adt_port.grid(row=0, column=1, **pad)
-        ttk.Button(adt, text="Refresh ports",
-                   command=self._refresh_ports).grid(row=0, column=2, **pad)
-        ttk.Button(adt, text="Connect",
-                   command=self._connect_adt).grid(row=0, column=3, **pad)
-        ttk.Button(adt, text="Disconnect",
-                   command=self._disconnect_adt).grid(row=0, column=4, **pad)
-        self.lbl_adt = ttk.Label(adt, text="Not connected",
+        self.pick_adt = ConnectionPicker(adt, on_log=self._instrument_log)
+        self.pick_adt.grid(row=0, column=0, columnspan=6, sticky="w", **pad)
+        btns = ttk.Frame(adt)
+        btns.grid(row=1, column=0, columnspan=6, sticky="w", padx=6)
+        ttk.Button(btns, text="Connect",
+                   command=self._connect_adt).pack(side="left", padx=4)
+        ttk.Button(btns, text="Disconnect",
+                   command=self._disconnect_adt).pack(side="left", padx=4)
+        self.lbl_adt = ttk.Label(btns, text="Not connected",
                                  foreground="#b00020")
-        self.lbl_adt.grid(row=0, column=5, sticky="w", **pad)
+        self.lbl_adt.pack(side="left", padx=10)
         ttk.Label(adt, foreground="#555", wraplength=980, justify="left",
                   text=("Channels are read as the 286 has them configured. "
                         "The suite never changes the 286's channel setup or "
                         "units, because those are global and other runs "
                         "would be affected — set sensor types on the "
                         "instrument before starting.")).grid(
-            row=1, column=0, columnspan=6, sticky="w", padx=8)
+            row=2, column=0, columnspan=6, sticky="w", padx=8)
         self.lst_channels = tk.Listbox(adt, height=7, width=52)
-        self.lst_channels.grid(row=2, column=0, columnspan=3, sticky="w",
+        self.lst_channels.grid(row=3, column=0, columnspan=3, sticky="w",
                                padx=8, pady=6)
         self.lbl_channel_use = ttk.Label(adt, text="", justify="left",
                                          foreground="#444")
-        self.lbl_channel_use.grid(row=2, column=3, columnspan=3, sticky="nw",
+        self.lbl_channel_use.grid(row=3, column=3, columnspan=3, sticky="nw",
                                   padx=8, pady=6)
 
-        hs = ttk.LabelFrame(t, text="Heat sources (each on its own port)")
+        hs = ttk.LabelFrame(t, text="Heat sources (each on its own "
+                                    "connection)")
         hs.pack(fill="both", expand=True, padx=8, pady=8)
         row = ttk.Frame(hs)
         row.pack(fill="x", padx=6, pady=6)
@@ -289,23 +459,21 @@ class SuiteApp(tk.Tk):
         self.cbo_new_source = ttk.Combobox(row, textvariable=self.var_new_source,
                                            width=46, state="readonly")
         self.cbo_new_source.pack(side="left", padx=6)
-        ttk.Label(row, text="on port").pack(side="left")
-        self.var_source_port = tk.StringVar()
-        self.cbo_source_port = ttk.Combobox(row,
-                                            textvariable=self.var_source_port,
-                                            width=28, state="readonly")
-        self.cbo_source_port.pack(side="left", padx=6)
         ttk.Button(row, text="Connect heat source",
                    command=self._connect_source).pack(side="left", padx=6)
         ttk.Button(row, text="Disconnect selected",
                    command=self._disconnect_source).pack(side="left")
+        ttk.Button(row, text="Check / discover commands",
+                   command=self._verify_source).pack(side="left", padx=8)
+        self.pick_source = ConnectionPicker(hs, on_log=self._instrument_log)
+        self.pick_source.pack(fill="x", padx=6, pady=(0, 6))
 
         cols = ("name", "model", "port", "range", "status")
         self.tbl_sources = ttk.Treeview(hs, columns=cols, show="headings",
                                         height=8)
-        for c, w, txt in (("name", 210, "Heat source"), ("model", 90, "Model"),
-                          ("port", 90, "Port"), ("range", 150, "Range"),
-                          ("status", 240, "Status")):
+        for c, w, txt in (("name", 200, "Heat source"), ("model", 80, "Model"),
+                          ("port", 180, "Connection"),
+                          ("range", 140, "Range"), ("status", 220, "Status")):
             self.tbl_sources.heading(c, text=txt)
             self.tbl_sources.column(c, width=w, anchor="w")
         self.tbl_sources.pack(fill="both", expand=True, padx=6, pady=6)
@@ -505,14 +673,10 @@ class SuiteApp(tk.Tk):
 
     # -------------------------------------------------------------- ports --
     def _refresh_ports(self):
-        vals = [f"{d} — {desc}" for d, desc in available_ports()]
-        self.cbo_adt_port["values"] = vals
-        self.cbo_source_port["values"] = vals
-        if vals:
-            if not self.var_adt_port.get():
-                self.var_adt_port.set(vals[0])
-            if not self.var_source_port.get():
-                self.var_source_port.set(vals[0])
+        for picker in (getattr(self, "pick_adt", None),
+                       getattr(self, "pick_source", None)):
+            if picker is not None:
+                picker.refresh_ports()
         choices = [p.get("name", "?") for p in self.source_profiles]
         choices += [f"[new] Fluke {t}" if not t.startswith("878")
                     else f"[new] Additel {t}" for t in KNOWN_MODELS]
@@ -526,25 +690,28 @@ class SuiteApp(tk.Tk):
 
     # --------------------------------------------------------------- ADT --
     def _connect_adt(self):
-        port = self._port_of(self.var_adt_port.get())
-        if not port:
-            messagebox.showerror("Connect", "Choose the 286's COM port first.")
+        target = self.pick_adt.get_target()
+        if not target_is_set(target):
+            messagebox.showerror(
+                "Connect",
+                "Fill in how to reach the 286 first — a COM port for USB, or "
+                "an address for a network connection.")
             return
+        where = describe_target(target)
 
         def work():
             try:
-                self.adt.connect(port)
+                self.adt.connect(target)
                 self.after(0, self._adt_connected)
             except Exception as e:
                 self.after(0, lambda: messagebox.showerror(
-                    "ADT286", f"Could not connect on {port}:\n{e}\n\n"
-                              "Check the Additel USB driver is installed and "
-                              "that no other program holds the port."))
+                    "ADT286", f"Could not connect on {where}:\n{e}"))
         threading.Thread(target=work, daemon=True).start()
 
     def _adt_connected(self):
-        self.lbl_adt.configure(text=f"Connected — {self.adt.idn} "
-                                    f"({self.adt.unit})", foreground="#1a7f37")
+        self.lbl_adt.configure(
+            text=f"Connected via {describe_target(self.adt.link.spec)} — "
+                 f"{self.adt.idn} ({self.adt.unit})", foreground="#1a7f37")
         self.lst_channels.delete(0, "end")
         for c in self.adt.channels:
             self.lst_channels.insert("end", self.adt.describe(c))
@@ -566,11 +733,17 @@ class SuiteApp(tk.Tk):
     # ------------------------------------------------------- heat sources --
     def _connect_source(self):
         choice = self.var_new_source.get()
-        port = self._port_of(self.var_source_port.get())
-        if not choice or not port:
-            messagebox.showerror("Heat source",
-                                 "Pick a heat source and a port first.")
+        target = self.pick_source.get_target()
+        if not choice:
+            messagebox.showerror("Heat source", "Pick a heat source first.")
             return
+        if not target_is_set(target):
+            messagebox.showerror(
+                "Heat source",
+                "Fill in how to reach it — a COM port for a cable or a paired "
+                "Bluetooth port, or an address for Ethernet/Wi-Fi.")
+            return
+        where = describe_target(target)
         if choice.startswith("[new] "):
             token = choice.rsplit(" ", 1)[-1]
             profile = profile_for_model(token)
@@ -593,10 +766,10 @@ class SuiteApp(tk.Tk):
             return
         source = HeatSource(profile, logger=self._instrument_log)
         try:
-            source.connect(port)
+            source.connect(target)
         except Exception as e:
             messagebox.showerror("Heat source",
-                                 f"Could not connect {name} on {port}:\n{e}")
+                                 f"Could not connect {name} on {where}:\n{e}")
             return
         self.sources[name] = source
         self._refresh_source_table()
@@ -605,6 +778,71 @@ class SuiteApp(tk.Tk):
             self.var_p_source.set(name)
         for item in source.family_checklist():
             self._log("INFO", f"[{name}] check: {item}")
+
+    def _verify_source(self):
+        """Prove (or discover) the selected heat source's command set."""
+        sel = self.tbl_sources.selection()
+        if not sel:
+            messagebox.showinfo("Check commands",
+                                "Select a connected heat source in the table "
+                                "first.")
+            return
+        name = self.tbl_sources.item(sel[0], "values")[0]
+        source = self.sources.get(name)
+        if source is None or not source.is_open:
+            messagebox.showerror("Check commands",
+                                 f"{name} is not connected.")
+            return
+
+        def work():
+            try:
+                report = source.verify_commands(log=self._instrument_log)
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror(
+                    "Check commands", f"{source.name}: {e}"))
+                return
+            self.after(0, lambda: self._verified(source, report))
+        self._log("INFO", f"[{name}] checking commands over "
+                          f"{source.connection}…")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _verified(self, source, report):
+        """Show what the instrument actually answered to."""
+        name = source.name
+        adopted = report.get("adopted", {})
+        failed = report.get("failed", [])
+        if adopted:
+            self._save_source_profile(source)
+            self._log("INFO", f"[{name}] saved to the profile library.")
+        lines = [f"{name} — {report.get('idn') or 'no identity reply'}", ""]
+        for key in ("sp_write", "sp_read", "value", "unit"):
+            if key in adopted:
+                lines.append(f"  {key:9s} {adopted[key]}")
+        if failed:
+            lines += ["", "Could not find: " + ", ".join(failed), "",
+                      "Enter these by hand in heat_source_profiles.json, or "
+                      "check Additel's 'Programming Commands' PDF for the "
+                      "exact syntax. The Activity log shows everything that "
+                      "was tried."]
+        elif report.get("verified"):
+            lines += ["", "Every command was proved on the instrument, "
+                          "including the set-point write (tested with a small "
+                          "change and restored)."]
+        else:
+            lines += ["", "Commands answered, but the set-point write could "
+                          "not be confirmed by readback."]
+        messagebox.showinfo("Command check", "\n".join(lines))
+
+    def _save_source_profile(self, source):
+        """Persist a heat source profile back to the shared library."""
+        profile = dict(source.profile)
+        for i, ex in enumerate(self.source_profiles):
+            if ex.get("name") == profile.get("name"):
+                self.source_profiles[i] = profile
+                break
+        else:
+            self.source_profiles.append(profile)
+        self._save(SOURCE_LIB, self.source_profiles)
 
     def _disconnect_source(self):
         sel = self.tbl_sources.selection()
@@ -634,10 +872,10 @@ class SuiteApp(tk.Tk):
                          if e.is_active and e.heat_source.name == name), None)
             status = (f"running '{busy}'" if busy
                       else ("connected" if s.is_open else "disconnected"))
-            self.tbl_sources.insert("", "end",
-                                    values=(name, s.profile.get("model", ""),
-                                            s.profile.get("port", ""), rng,
-                                            status))
+            self.tbl_sources.insert(
+                "", "end",
+                values=(name, s.profile.get("model", ""), s.connection, rng,
+                        status))
 
     # ------------------------------------------------------------ profiles --
     def _refresh_run_list(self):

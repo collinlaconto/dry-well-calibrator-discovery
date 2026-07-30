@@ -8,8 +8,11 @@ profile's range raises rather than being clamped.
 import threading
 import time
 
-from .formats import FAMILIES, TERMINATORS, first_float
-from .transport import SerialLink
+from .formats import (FAMILIES, SP_READ_CANDIDATES, TERMINATORS,
+                      UNIT_CANDIDATES, VALUE_CANDIDATES,
+                      WRITE_PAIRS, first_float)
+from .transport import (describe_target, make_link, normalize_target,
+                        target_is_set)
 
 
 class RangeError(ValueError):
@@ -21,10 +24,9 @@ class HeatSource:
         self.profile = dict(profile)
         self.log = logger or (lambda tag, msg: None)
         self.lock = threading.RLock()
-        self.link = SerialLink(
-            terminator=TERMINATORS.get(profile.get("terminator_name", "CRLF"),
-                                       "\r\n"),
-            reply_timeout=1.5)
+        self.terminator = TERMINATORS.get(
+            profile.get("terminator_name", "CRLF"), "\r\n")
+        self.link = None
         self.idn = ""
 
     # ------------------------------------------------------------ helpers --
@@ -50,27 +52,45 @@ class HeatSource:
     # -------------------------------------------------------- connection ---
     @property
     def is_open(self):
-        return self.link.is_open
+        return self.link is not None and self.link.is_open
 
-    def connect(self, port, baud=None):
-        baud = baud or self.profile.get("baud") or "9600"
+    @property
+    def target(self):
+        return normalize_target(self.profile.get("target")
+                                or self.profile.get("port"),
+                                self.profile.get("baud") or "9600")
+
+    @property
+    def connection(self):
+        """One-line description of how this instrument is reached."""
+        return describe_target(self.target)
+
+    def connect(self, target=None):
+        """Connect over serial/Bluetooth SPP or the network."""
+        t = normalize_target(target if target is not None else self.target,
+                             self.profile.get("baud") or "9600")
+        if not target_is_set(t):
+            raise RuntimeError(f"{self.name}: no port or address given.")
         with self.lock:
-            self.link.open(port, baud,
-                           TERMINATORS.get(
-                               self.profile.get("terminator_name", "CRLF"),
-                               "\r\n"))
+            self.link = make_link(t, terminator=self.terminator,
+                                  reply_timeout=1.5)
+            self.link.open(t)
             try:
                 self.idn = self.link.query("*IDN?")
             except Exception:
                 self.idn = ""
-        self.profile["port"] = port
-        self.profile["baud"] = str(baud)
-        self.log("PASS", f"{self.name} connected on {port} @ {baud}")
+        self.profile["target"] = t
+        if t["kind"] in ("serial", "bluetooth"):
+            self.profile["port"] = t.get("port", "")
+            self.profile["baud"] = str(t.get("baud", "9600"))
+        self.log("PASS", f"{self.name} connected on {describe_target(t)}"
+                         + (f" - {self.idn}" if self.idn else ""))
         return self.idn
 
     def disconnect(self):
         with self.lock:
-            self.link.close()
+            if self.link is not None:
+                self.link.close()
         self.log("INFO", f"{self.name} disconnected.")
 
     # ------------------------------------------------------------ control --
@@ -148,3 +168,119 @@ class HeatSource:
     def family_checklist(self):
         fam = FAMILIES.get(self.profile.get("family") or "unknown")
         return list(fam.get("checklist", []))
+
+    # ------------------------------------------------------ verification ----
+    def verify_commands(self, test_delta=0.5, restore=True, log=None):
+        """Probe candidate commands live and adopt whatever the instrument
+        actually answers.
+
+        This is how a heat source whose syntax isn't documented (the Additel
+        878s, for instance) gets a working profile: nothing is assumed, each
+        command has to prove itself on the instrument. Only the set-point write
+        makes a change, by a small delta that is then restored, and the output
+        enable is never sent.
+
+        Returns a report dict; adopted commands are written into the profile.
+        """
+        say = log or (lambda tag, msg: self.log(tag, msg))
+        if not self.is_open:
+            raise RuntimeError(f"{self.name} is not connected.")
+        report = {"idn": "", "adopted": {}, "failed": [], "verified": False}
+
+        with self.lock:
+            report["idn"] = self.idn or self.link.query("*IDN?")
+            say("INFO", f"{self.name} identifies as: "
+                        f"{report['idn'] or '(no reply)'}")
+
+            def try_candidates(label, candidates, parser):
+                for cmd in candidates:
+                    if not cmd:
+                        continue
+                    reply = self.link.query(cmd)
+                    value = parser(reply) if reply else None
+                    if value is not None and value != "":
+                        say("PASS", f"{label}: {cmd!r} works (reply {reply!r})")
+                        return cmd, value
+                    say("INFO", f"{label}: {cmd!r} - no usable reply")
+                say("FAIL", f"{label}: nothing worked. Enter it by hand, or "
+                            "check the instrument's command document.")
+                report["failed"].append(label)
+                return None, None
+
+            # order: whatever the profile already has, then family, then generic
+            fam = FAMILIES.get(self.profile.get("family") or "unknown", {})
+            fam_cmds = fam.get("commands") or {}
+
+            def order(key, generic):
+                seen, out = set(), []
+                for cmd in ([self._cmd(key), fam_cmds.get(key)] + list(generic)):
+                    if cmd and cmd not in seen:
+                        seen.add(cmd)
+                        out.append(cmd)
+                return out
+
+            sp_read, original = try_candidates(
+                "Set-point read", order("sp_read", SP_READ_CANDIDATES),
+                first_float)
+            if sp_read:
+                report["adopted"]["sp_read"] = sp_read
+
+            value_cmd, _ = try_candidates(
+                "Value (block temperature)", order("value", VALUE_CANDIDATES),
+                first_float)
+            if value_cmd:
+                report["adopted"]["value"] = value_cmd
+
+            unit_cmd, _ = try_candidates(
+                "Unit read", order("unit", UNIT_CANDIDATES),
+                lambda r: (r or "").strip())
+            if unit_cmd:
+                report["adopted"]["unit"] = unit_cmd
+
+            # set-point write: only meaningful if we can read it back
+            if sp_read and original is not None:
+                write = self._cmd("sp_write") or fam_cmds.get("sp_write") \
+                    or WRITE_PAIRS.get(sp_read)
+                if not write:
+                    say("FAIL", "Set-point write: no known pairing for "
+                                f"{sp_read!r}; enter it by hand.")
+                    report["failed"].append("Set-point write")
+                else:
+                    lo, hi = self.range
+                    target = original + test_delta
+                    if lo is not None and not (lo <= target <= hi):
+                        target = original - test_delta
+                    if lo is not None and not (lo <= target <= hi):
+                        target = original
+                    if abs(target - original) < 1e-9:
+                        say("WARN", "Range too tight to test a set-point "
+                                    "change; write command not verified.")
+                        report["adopted"]["sp_write"] = write
+                    else:
+                        self.link.write(write.replace("{value}",
+                                                      f"{target:.2f}"))
+                        time.sleep(0.4)
+                        rb = first_float(self.link.query(sp_read))
+                        if rb is not None and abs(rb - target) <= 0.05:
+                            say("PASS", f"Set-point write: {write!r} verified "
+                                        f"(wrote {target:.2f}, read {rb}).")
+                            report["adopted"]["sp_write"] = write
+                            report["verified"] = True
+                        else:
+                            say("FAIL", f"Set-point write: wrote {target:.2f} "
+                                        f"but read back {rb}. The set point "
+                                        "may be locked on the instrument.")
+                            report["failed"].append("Set-point write")
+                            report["adopted"]["sp_write"] = write
+                        if restore:
+                            self.link.write(write.replace("{value}",
+                                                          f"{original:.2f}"))
+                            time.sleep(0.3)
+                            say("INFO", f"Set point restored to {original:g}.")
+
+        self.profile.update(report["adopted"])
+        self.profile["verified"] = report["verified"]
+        if not report["failed"]:
+            say("PASS", f"{self.name}: all commands verified on the "
+                        "instrument.")
+        return report

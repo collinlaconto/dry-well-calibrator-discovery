@@ -27,7 +27,8 @@ e.g. "REF1,1281,1,28.258167,28.258167,1001,1,33.512077;"
 import threading
 import time
 
-from .transport import SerialLink
+from .transport import (describe_target, make_link,
+                        normalize_target, target_is_set)
 
 TEMP_UNIT_IDS = {1000: "K", 1001: "°C", 1002: "°F", 1003: "°R", 999: "°Re"}
 ELEC_UNIT_IDS = {1281: "Ω", 1284: "kΩ", 1283: "MΩ", 1243: "mV", 1240: "V",
@@ -183,8 +184,7 @@ class Adt286:
 
     def __init__(self, logger=None):
         self.log = logger or (lambda tag, msg: None)
-        self.link = SerialLink(terminator="\r\n", reply_timeout=2.0,
-                               logger=lambda t, m: None)
+        self.link = None
         self.lock = threading.RLock()          # guards the serial link
         self.idn = ""
         self.unit = ""
@@ -202,20 +202,27 @@ class Adt286:
     # ------------------------------------------------------------ session --
     @property
     def is_open(self):
-        return self.link.is_open
+        return self.link is not None and self.link.is_open
 
-    def connect(self, port, baud=9600):
+    def connect(self, target, baud=9600):
+        """Connect over USB/serial or the network (Ethernet / Wi-Fi)."""
+        t = normalize_target(target, str(baud))
+        if not target_is_set(t):
+            raise RuntimeError("No port or address given for the ADT286.")
         with self.lock:
-            self.link.open(port, baud, "\r\n", reply_timeout=2.0)
+            self.link = make_link(t, terminator="\r\n", reply_timeout=2.0)
+            self.link.open(t)
             self.idn = self.link.query("*IDN?")
             if not self.idn:
                 self.link.close()
                 raise RuntimeError(
-                    "No reply to *IDN? — check the COM port and that the "
-                    "Additel USB driver is installed.")
+                    "No reply to *IDN? on " + describe_target(t) + ". Over "
+                    "USB, check the Additel USB driver is installed; over the "
+                    "network, check the address and port (use 'Find port').")
             unit_reply = self.link.query("UNIT:TEMPerature?")
             self.unit = self._unit_from(unit_reply)
-        self.log("PASS", f"ADT286 connected: {self.idn} (unit {self.unit})")
+        self.log("PASS", f"ADT286 connected on {describe_target(t)}: "
+                         f"{self.idn} (unit {self.unit})")
         self.discover_channels()
         self._start_poller()
         return self.idn
@@ -234,12 +241,13 @@ class Adt286:
     def disconnect(self):
         self._stop_poller()
         with self.lock:
-            if self.link.is_open:
+            if self.link is not None and self.link.is_open:
                 try:
                     self.link.write("SCAN:STOP")
                 except Exception:
                     pass
-            self.link.close()
+            if self.link is not None:
+                self.link.close()
         self._subs.clear()
         self._readings.clear()
         self.log("INFO", "ADT286 disconnected.")
@@ -300,7 +308,7 @@ class Adt286:
     def _restart_scan(self):
         """Reconfigure the single shared scan for the union of subscribers."""
         chans = self.subscribed_channels()
-        if not self.link.is_open:
+        if self.link is None or not self.link.is_open:
             return
         if not chans:
             try:
@@ -333,7 +341,8 @@ class Adt286:
 
     def poll_once(self):
         """One scan read. Returns the number of channels updated."""
-        if not self.link.is_open or not self.subscribed_channels():
+        if (self.link is None or not self.link.is_open
+                or not self.subscribed_channels()):
             return 0
         with self.lock:
             try:

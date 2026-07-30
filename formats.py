@@ -9,6 +9,8 @@ Convention-derived (proved by live verification before use):
 
 import re
 
+from .transport import DEFAULT_TCP_PORT
+
 TERMINATORS = {"CRLF": "\r\n", "CR": "\r", "LF": "\n"}
 
 FAMILIES = {
@@ -70,14 +72,24 @@ FAMILIES = {
     },
     "additel_well": {
         "label": "Additel dry well / bath (875 / 878 series)",
+        # Left empty deliberately: Additel's published 878 command list was not
+        # available to confirm, so nothing is asserted here. Use "Verify
+        # commands" and the instrument itself decides what works.
         "commands": {},
         "value_alts": [],
-        "enable": "",
-        "disable": "",
+        "enable": "OUTP:STAT 1",
+        "disable": "OUTP:STAT 0",
         "password": "",
+        "probe": True,
         "checklist": [
-            "The ADT286 also ships native Additel drivers — check there first",
-            "Exact syntax: 'Programming Commands for 878' at additel.com",
+            "Run 'Verify commands' once — the syntax below is adopted from "
+            "what the instrument actually answers, not assumed",
+            "The ADT286 also ships native Additel drivers, useful as a "
+            "cross-check",
+            "Authoritative syntax: 'Programming Commands for 878' at "
+            "additel.com/productresources",
+            "On Wi-Fi/Ethernet, read the IP off the instrument's network "
+            "screen; use 'Find port' if the socket port is unknown",
         ],
     },
     "generic_scpi": {
@@ -121,6 +133,29 @@ KNOWN_MODELS = {
 }
 
 
+# Candidates tried by HeatSource.verify_commands when a profile has no
+# proven command set. Ordered most-likely-first. Nothing here is asserted to
+# be correct for any particular instrument -- the point is to find out which
+# one it actually answers.
+SP_READ_CANDIDATES = ("SOUR:SPO?", "SOUR:SPOint?", "SOUR:TEMP:SPO?",
+                      "SOUR:SPO:TEMP?", "SETP?", "SP?", "s")
+VALUE_CANDIDATES = ("SOUR:SENS:DAT? TEMP", "SOUR:SENS:DATA?", "MEAS:TEMP?",
+                    "MEAS?", "SOUR:TEMP?", "t")
+UNIT_CANDIDATES = ("UNIT:TEMP?", "UNIT:TEMPerature?", "u")
+ENABLE_CANDIDATES = ("OUTP:STAT 1", "OUTP:STATe ON")
+
+# A verified set-point read implies its paired write command.
+WRITE_PAIRS = {
+    "SOUR:SPO?": "SOUR:SPO {value}",
+    "SOUR:SPOint?": "SOUR:SPOint {value}",
+    "SOUR:TEMP:SPO?": "SOUR:TEMP:SPO {value}",
+    "SOUR:SPO:TEMP?": "SOUR:SPO:TEMP {value}",
+    "SETP?": "SETP {value}",
+    "SP?": "SP {value}",
+    "s": "s={value}",
+}
+
+
 def first_float(text):
     """First numeric value in a reply, or None."""
     if not text:
@@ -137,6 +172,17 @@ def model_info(text):
             return {"token": token, "family": family, "lo": lo, "hi": hi,
                     "kind": kind}
     return None
+
+
+# Models that are typically reached over the network rather than a cable.
+NETWORK_FIRST_MODELS = ("878-160", "878-425", "878-700")
+
+
+def default_target(token):
+    """Suggested connection for a model: network first where that is usual."""
+    if any(token.startswith(m) or m in token for m in NETWORK_FIRST_MODELS):
+        return {"kind": "tcp", "host": "", "tcp_port": 5025}
+    return {"kind": "serial", "port": "", "baud": "9600"}
 
 
 def profile_for_model(token, make=None, sn=""):
@@ -159,6 +205,7 @@ def profile_for_model(token, make=None, sn=""):
         "range_unit": "°C",
         "baud": "9600",
         "terminator_name": "CRLF",
+        "target": default_target(token),
         "sp_write": cmds.get("sp_write", ""),
         "sp_read": cmds.get("sp_read", ""),
         "value": cmds.get("value", ""),
