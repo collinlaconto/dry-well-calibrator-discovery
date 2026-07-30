@@ -16,7 +16,8 @@ from .engine import (ChannelRegistry, RunEngine, default_profile,
                      validate_profile, STATE_RUNNING)
 from .formats import KNOWN_MODELS, profile_for_model
 from .heatsource import HeatSource
-from .transport import (CANDIDATE_TCP_PORTS, SERIAL_OK, SERIAL_ERROR,
+from .transport import (CANDIDATE_TCP_PORTS, DEFAULT_TCP_PORT,
+                        SERIAL_OK, SERIAL_ERROR,
                         available_ports, describe_target, find_tcp_port,
                         normalize_target, target_is_set)
 
@@ -54,7 +55,7 @@ class ConnectionPicker(ttk.Frame):
         self.var_port = tk.StringVar()
         self.var_baud = tk.StringVar(value="9600")
         self.var_host = tk.StringVar()
-        self.var_tcp = tk.StringVar(value="5025")
+        self.var_tcp = tk.StringVar(value="8000")
         self.busy = False
 
         ttk.Label(self, text="Connection").grid(row=0, column=0, sticky="e",
@@ -137,9 +138,9 @@ class ConnectionPicker(ttk.Frame):
         kind = self.kind
         if kind == "tcp":
             try:
-                port = int(str(self.var_tcp.get()).strip() or 5025)
+                port = int(str(self.var_tcp.get()).strip() or DEFAULT_TCP_PORT)
             except ValueError:
-                port = 5025
+                port = DEFAULT_TCP_PORT
             return {"kind": "tcp", "host": self.var_host.get().strip(),
                     "tcp_port": port}
         raw = self.var_port.get()
@@ -151,7 +152,7 @@ class ConnectionPicker(ttk.Frame):
         self.var_kind.set(KIND_LABELS.get(t["kind"], KIND_LABELS["serial"]))
         if t["kind"] == "tcp":
             self.var_host.set(t.get("host", ""))
-            self.var_tcp.set(str(t.get("tcp_port", 5025)))
+            self.var_tcp.set(str(t.get("tcp_port", DEFAULT_TCP_PORT)))
         else:
             if t.get("port"):
                 match = [v for v in (self.cbo_port["values"] or [])
@@ -883,18 +884,27 @@ class SuiteApp(tk.Tk):
                                      "That profile is no longer available.")
                 return
             profile.setdefault("range_unit", "°C")
-        name = profile.get("name", "heat source")
-        if name in self.sources:
-            messagebox.showerror("Already connected",
-                                 f"{name} is already connected.")
-            return
+        base = profile.get("name", "heat source")
+        # A genuine duplicate is the same *connection*, not the same model
+        # name -- two identical wells at different addresses are fine.
+        for existing in self.sources.values():
+            if existing.is_open and existing.connection == where:
+                messagebox.showerror(
+                    "Already connected",
+                    f"{where} is already connected as '{existing.name}'.")
+                return
         source = HeatSource(profile, logger=self._instrument_log)
         try:
             source.connect(target)
         except Exception as e:
             messagebox.showerror("Heat source",
-                                 f"Could not connect {name} on {where}:\n{e}")
+                                 f"Could not connect {base} on {where}:\n{e}")
             return
+        name = self._unique_source_name(base, source)
+        if name != base:
+            source.profile["name"] = name
+            self._log("INFO", f"A heat source named '{base}' was already "
+                              f"connected, so this one is '{name}'.")
         self.sources[name] = source
         self._refresh_source_table()
         self.cbo_p_source["values"] = list(self.sources)
@@ -940,9 +950,14 @@ class SuiteApp(tk.Tk):
             self._save_source_profile(source)
             self._log("INFO", f"[{name}] saved to the profile library.")
         lines = [f"{name} — {report.get('idn') or 'no identity reply'}", ""]
-        for key in ("sp_write", "sp_read", "value", "unit"):
+        for key in ("sp_write", "sp_read", "value", "unit", "enable"):
             if key in adopted:
                 lines.append(f"  {key:9s} {adopted[key]}")
+        token = getattr(source, "unit_token", "")
+        if token:
+            from .formats import describe_unit_token
+            lines.append(f"  {'unit id':9s} {describe_unit_token(token)}"
+                         "   (sent automatically where the command needs it)")
         if failed:
             lines += ["", "Could not find: " + ", ".join(failed), "",
                       "Enter these by hand in heat_source_profiles.json, or "
@@ -968,6 +983,25 @@ class SuiteApp(tk.Tk):
         else:
             self.source_profiles.append(profile)
         self._save(SOURCE_LIB, self.source_profiles)
+
+    def _unique_source_name(self, base, source):
+        """A stable, unique key for a connected heat source.
+
+        Several identical wells are normal on a bench, so disambiguate by
+        the instrument's own serial number where it reports one, and by the
+        connection otherwise.
+        """
+        if base not in self.sources:
+            return base
+        serial = source.identity_serial or source.profile.get("sn") or ""
+        for candidate in ([f"{base} SN {serial}"] if serial else []) + \
+                         [f"{base} @ {source.connection}"]:
+            if candidate not in self.sources:
+                return candidate
+        n = 2
+        while f"{base} #{n}" in self.sources:
+            n += 1
+        return f"{base} #{n}"
 
     def _disconnect_source(self):
         sel = self.tbl_sources.selection()
@@ -1120,7 +1154,9 @@ class SuiteApp(tk.Tk):
     def _validate_profile(self, quiet=False):
         p = self._form_to_profile()
         hs = self.sources.get(p["heat_source"])
-        problems = validate_profile(p, hs, self.adt.channels or None)
+        problems = validate_profile(p, hs, self.adt.channels or None,
+                                    getattr(self.adt, "poll_interval", None)
+                                    if self.adt.is_open else None)
         busy = self.registry.in_use()
         for c in [p["reference_channel"]] + p["dut_channels"]:
             if c and c in busy:

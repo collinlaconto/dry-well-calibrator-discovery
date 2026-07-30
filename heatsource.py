@@ -11,7 +11,8 @@ import time
 from .formats import (CONTROL_PAIRS, ERROR_QUERY, FAMILIES,
                       NONSENSE_COMMAND, SP_READ_CANDIDATES, STABLE_CANDIDATES,
                       TERMINATORS, UNIT_CANDIDATES, VALUE_CANDIDATES,
-                      WRITE_PAIRS, first_float)
+                      WRITE_PAIRS, describe_unit_token, first_float,
+                      second_field, unit_token_for)
 from .transport import (describe_target, make_link, normalize_target,
                         target_is_set)
 
@@ -29,6 +30,10 @@ class HeatSource:
             profile.get("terminator_name", "CRLF"), "\r\n")
         self.link = None
         self.idn = ""
+        # Some instruments (Additel) require the unit alongside the value on
+        # a set-point write, and report it as the second field of the
+        # set-point read. Whatever they report is echoed straight back.
+        self.unit_token = str(profile.get("unit_token") or "")
 
     # ------------------------------------------------------------ helpers --
     @property
@@ -62,6 +67,12 @@ class HeatSource:
                                 self.profile.get("baud") or "9600")
 
     @property
+    def identity_serial(self):
+        """Serial number from *IDN? (manufacturer, model, serial, version)."""
+        parts = [p.strip() for p in (self.idn or "").split(",")]
+        return parts[2] if len(parts) > 2 else ""
+
+    @property
     def connection(self):
         """One-line description of how this instrument is reached."""
         return describe_target(self.target)
@@ -80,6 +91,11 @@ class HeatSource:
                 self.idn = self.link.query("*IDN?")
             except Exception:
                 self.idn = ""
+        if self._cmd("sp_read"):
+            try:
+                self._capture_unit(self.link.query(self._cmd("sp_read")))
+            except Exception:
+                pass
         self.profile["target"] = t
         if t["kind"] in ("serial", "bluetooth"):
             self.profile["port"] = t.get("port", "")
@@ -95,12 +111,43 @@ class HeatSource:
         self.log("INFO", f"{self.name} disconnected.")
 
     # ------------------------------------------------------------ control --
+    def _capture_unit(self, reply):
+        """Remember the unit the instrument reports alongside a value."""
+        token = second_field(reply)
+        if token and token != self.unit_token:
+            self.unit_token = token
+            self.profile["unit_token"] = token
+            self.log("INFO", f"{self.name}: unit token is "
+                             f"{describe_unit_token(token)}")
+        return reply
+
+    @property
+    def effective_unit_token(self):
+        """The token to substitute for {unit}: reported, stored, or mapped."""
+        return (self.unit_token
+                or str(self.profile.get("unit_token") or "")
+                or unit_token_for(self.unit))
+
+    def format_setpoint_command(self, template, value):
+        """Fill {value} and, when required, {unit} in a write template."""
+        out = template.replace("{value}", f"{value:.2f}")
+        if "{unit}" in out:
+            token = self.effective_unit_token
+            if not token:
+                raise RuntimeError(
+                    f"{self.name}: this set-point command needs a unit, but "
+                    "none is known yet. Read the set point once (or run "
+                    "Check / discover commands) so the instrument can report "
+                    "it.")
+            out = out.replace("{unit}", token)
+        return out
+
     def read_setpoint(self):
         cmd = self._cmd("sp_read")
         if not cmd:
             return None
         with self.lock:
-            return first_float(self.link.query(cmd))
+            return first_float(self._capture_unit(self.link.query(cmd)))
 
     def read_temperature(self):
         """The heat source's own block/control sensor (not the reference)."""
@@ -108,7 +155,7 @@ class HeatSource:
         if not cmd:
             return None
         with self.lock:
-            return first_float(self.link.query(cmd))
+            return first_float(self._capture_unit(self.link.query(cmd)))
 
     def set_setpoint(self, value, send_password=False):
         tmpl = self._cmd("sp_write")
@@ -122,11 +169,18 @@ class HeatSource:
                 f"{value:g} {self.unit} is outside {self.name}'s range "
                 f"({lo:g} to {hi:g} {self.unit}). Nothing was sent.")
         with self.lock:
+            if "{unit}" in tmpl and not self.effective_unit_token:
+                # Ask the instrument what unit it wants before writing.
+                try:
+                    self._capture_unit(self.link.query(self._cmd("sp_read")))
+                except Exception:
+                    pass
+            command = self.format_setpoint_command(tmpl, value)
             pw = self._cmd("password")
             if send_password and pw:
                 self.link.write(pw)
                 time.sleep(0.1)
-            self.link.write(tmpl.replace("{value}", f"{value:.2f}"))
+            self.link.write(command)
         self.log("INFO", f"{self.name}: set point -> {value:g} {self.unit}")
         return True
 
@@ -288,6 +342,12 @@ class HeatSource:
                 first_float)
             if sp_read:
                 report["adopted"]["sp_read"] = sp_read
+                self._capture_unit(self.link.query(sp_read))
+                if self.unit_token:
+                    report["unit_token"] = self.unit_token
+                    say("INFO", f"The set point is reported with a unit "
+                                f"({describe_unit_token(self.unit_token)}), "
+                                "so the write may need it too.")
 
             value_cmd, _ = try_candidates(
                 "Value (block temperature)", order("value", VALUE_CANDIDATES),
@@ -344,15 +404,39 @@ class HeatSource:
                                     "change; write command not verified.")
                         report["adopted"]["sp_write"] = write
                     else:
-                        accepted, _ = self._accepted(
-                            write.replace("{value}", f"{target:.2f}"),
-                            use_errors, expect_reply=False)
-                        time.sleep(0.4)
-                        rb = first_float(self.link.query(sp_read))
-                        good = (rb is not None and abs(rb - target) <= 0.05)
+                        # Some instruments want the unit alongside the value.
+                        # Try both shapes, preferring the one the set-point
+                        # read implies.
+                        plain = write.replace(",{unit}", "")
+                        with_unit = (plain if "{unit}" in plain
+                                     else plain + ",{unit}")
+                        variants = ([with_unit, plain] if self.unit_token
+                                    else [plain, with_unit])
+                        good, chosen, rb = False, None, None
+                        for variant in variants:
+                            try:
+                                command = self.format_setpoint_command(
+                                    variant, target)
+                            except RuntimeError:
+                                continue
+                            self._accepted(command, use_errors,
+                                           expect_reply=False)
+                            time.sleep(0.4)
+                            rb = first_float(
+                                self._capture_unit(self.link.query(sp_read)))
+                            if rb is not None and abs(rb - target) <= 0.05:
+                                good, chosen = True, variant
+                                break
+                            say("INFO", f"Set-point write: {variant!r} did "
+                                        f"not take (read back {rb}).")
+                        write = chosen or write
                         if good:
+                            extra = ("  It needs the unit, supplied "
+                                     "automatically from the instrument's own "
+                                     "reply." if "{unit}" in write else "")
                             say("PASS", f"Set-point write: {write!r} verified "
-                                        f"(wrote {target:.2f}, read {rb}).")
+                                        f"(wrote {target:.2f}, read {rb})."
+                                        + extra)
                             report["adopted"]["sp_write"] = write
                             report["verified"] = True
                         elif rb is None:
@@ -381,10 +465,16 @@ class HeatSource:
                             report["failed"].append("Set-point write")
                             report["adopted"]["sp_write"] = write
                         if restore:
-                            self.link.write(
-                                write.replace("{value}", f"{original:.2f}"))
-                            time.sleep(0.3)
-                            say("INFO", f"Set point restored to {original:g}.")
+                            try:
+                                self.link.write(
+                                    self.format_setpoint_command(write,
+                                                                 original))
+                                time.sleep(0.3)
+                                say("INFO", f"Set point restored to "
+                                            f"{original:g}.")
+                            except RuntimeError as exc:
+                                say("WARN", f"Could not restore the set "
+                                            f"point: {exc}")
 
         self.profile.update(report["adopted"])
         self.profile["verified"] = report["verified"]

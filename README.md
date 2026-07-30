@@ -43,10 +43,11 @@ it is plugged in.
 | Network (Ethernet / Wi-Fi) | IP address + socket port | **Find port** discovers the port for you |
 | Bluetooth (paired SPP port) | the COM port pairing created | Pair in the OS first; Windows exposes an outgoing COM port |
 
-**If you don't know the socket port**, type the IP and press **Find port**. It
-asks each likely port (5025 first — the IANA "scpi-raw" port — then 5000,
-8080, 8888, 2000, 23, 1024, 10001) for its identity and fills in whichever
-answers `*IDN?`. Ports that are open but silent are ignored, so a stray web
+**Additel devices use port 8000**, which is the default here. If you are
+unsure, type the IP and press **Find port**: it asks each likely port (8000
+first, then 5025 — the IANA "scpi-raw" port used by most other lab gear —
+then 5000, 8080, 8888, 2000, 23, 1024, 10001) for its identity and fills in
+whichever answers `*IDN?`. Ports that are open but silent are ignored, so a stray web
 server cannot be mistaken for the instrument.
 
 **Bluetooth**: pairing a Serial Port Profile device creates a virtual COM
@@ -89,6 +90,32 @@ judging by replies.
 Discovery is safe: only the set-point write changes anything, by a small
 delta that is then restored, and the heat/cool command is found from its
 read-only query form and never actuated.
+
+### Set-point commands that need the unit
+
+Additel wells report the set point as **value and unit** — e.g.
+`TEMPerature:TARGet?` returns `60.0000,1001` — and the write command requires
+that unit back: `TEMPerature:TARGet 60.00,1001`. Sent without it, the
+instrument answers `-109 Missing parameter` and the set point never changes.
+
+The suite handles this with a `{unit}` placeholder in the write template:
+
+```
+TEMPerature:TARGet {value},{unit}     ->   TEMPerature:TARGet 60.00,1001
+```
+
+The token is never hard-coded. It is taken from the instrument's own reply —
+the second field of the set-point read — and refreshed on every read, so a
+well switched to °F (`1002`) is followed automatically. Discovery tries both
+shapes and keeps whichever the readback proves, preferring the unit-bearing
+form when the read reply carries a unit. If nothing has reported a unit yet,
+the suite reads the set point once to obtain one before writing, and falls
+back to mapping the profile's display unit (°C = 1001, °F = 1002, K = 1000)
+only as a last resort. The adopted unit is saved with the profile, so later
+sessions work immediately.
+
+To use it in a hand-written profile, just put `{unit}` in `sp_write` inside
+`heat_source_profiles.json`.
 
 ### If discovery still comes up empty
 
@@ -165,6 +192,25 @@ tolerates the longer thermocouple form with cold-junction blocks appended.
 Fluke 917X and 6109A/7109A command sets are from their manuals. The classic
 Micro-Bath syntax (`t`, `s=`, `u`) is convention-derived, and the Additel 878
 syntax is left to live discovery — verify both before trusting a run to them.
+
+## Several identical wells
+
+Two 878-160s are told apart by their **connection**, not their model name. The
+first connects as "Additel 878-160"; a second at a different address becomes
+"Additel 878-160 SN <serial>" (or "@ <address>" if it reports no serial), and
+both appear separately with their own profiles and runs. Only the *same
+address* twice is refused, naming the source already using it.
+
+## Stability window vs scan rate
+
+The 286 is scanned about once a second, and stability needs at least three
+readings inside the window, so a window shorter than ~3 s can never be
+satisfied — every set point would time out even with a perfectly steady bath.
+"Check this profile" catches that before a run starts and says what to use
+instead, and the same applies to a sample interval faster than the scan.
+Timeout notes now distinguish "never had enough readings to judge" from
+"readings were not flat enough", so a real timeout is not confused with a
+misconfigured one.
 
 ## Limits worth knowing before the first real run
 

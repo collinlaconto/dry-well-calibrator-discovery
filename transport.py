@@ -25,12 +25,12 @@ except Exception as _e:                                   # pragma: no cover
     SERIAL_OK = False
     SERIAL_ERROR = str(_e)
 
-# Ports worth trying when looking for a networked instrument. 5025 is the
-# IANA "scpi-raw" port and the usual default; the others are common
-# alternatives on lab gear.
-CANDIDATE_TCP_PORTS = (5025, 5000, 8080, 8888, 2000, 23, 1024, 10001)
+# Ports worth trying when looking for a networked instrument. 8000 is
+# Additel's default and goes first; 5025 is the IANA "scpi-raw" port used by
+# most other lab gear; the rest are common alternatives.
+CANDIDATE_TCP_PORTS = (8000, 5025, 5000, 8080, 8888, 2000, 23, 1024, 10001)
 
-DEFAULT_TCP_PORT = 5025
+DEFAULT_TCP_PORT = 8000
 
 
 def available_ports():

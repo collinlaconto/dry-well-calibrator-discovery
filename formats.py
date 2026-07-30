@@ -204,6 +204,40 @@ WRITE_PAIRS = {
 ERROR_QUERY = "SYSTem:ERRor?"
 NONSENSE_COMMAND = "ZZQQ:NOSUCH?"
 
+# SCPI unit IDs from Additel's published unit table.
+UNIT_ID_NAMES = {"1000": "K", "1001": "°C", "1002": "°F", "1003": "°R",
+                 "999": "°Re"}
+UNIT_NAME_IDS = {"K": "1000", "C": "1001", "F": "1002", "R": "1003"}
+
+
+def second_field(reply):
+    """Second comma-separated field of a reply, or ''.
+
+    Additel replies to a target query with value AND unit, e.g.
+    "60.0000,1001" or "0.10000,MPa". That trailing field is what a write
+    command has to echo back.
+    """
+    if not reply:
+        return ""
+    parts = [p.strip() for p in str(reply).split(",")]
+    return parts[1] if len(parts) > 1 and parts[1] else ""
+
+
+def unit_token_for(unit_name):
+    """Best-guess unit token ('1001') for a display unit ('°C')."""
+    key = (unit_name or "").strip().upper().replace("°", "").replace("DEG", "")
+    return UNIT_NAME_IDS.get(key, "")
+
+
+def describe_unit_token(token):
+    """Human label for a unit token, for logs and dialogs."""
+    token = (token or "").strip()
+    if not token:
+        return "(none)"
+    if token in UNIT_ID_NAMES:
+        return f"{token} = {UNIT_ID_NAMES[token]}"
+    return token
+
 
 def first_float(text):
     """First numeric value in a reply, or None."""

@@ -93,7 +93,11 @@ def default_profile(name="New profile"):
     }
 
 
-def validate_profile(profile, heat_source=None, available_channels=None):
+MIN_STABILITY_SAMPLES = 3
+
+
+def validate_profile(profile, heat_source=None, available_channels=None,
+                     poll_interval=None):
     """Return a list of human-readable problems ([] means good to go)."""
     problems = []
     ref = (profile.get("reference_channel") or "").strip()
@@ -133,6 +137,22 @@ def validate_profile(profile, heat_source=None, available_channels=None):
         problems.append("Stability band must be greater than zero.")
     if profile.get("stability_window", 0) <= 0:
         problems.append("Stability window must be greater than zero.")
+    if poll_interval:
+        window = float(profile.get("stability_window") or 0)
+        needed = MIN_STABILITY_SAMPLES * float(poll_interval)
+        if 0 < window < needed:
+            problems.append(
+                f"The stability window ({window:g} s) is too short for the "
+                f"286's scan rate (a reading about every {poll_interval:g} s). "
+                f"Stability needs at least {MIN_STABILITY_SAMPLES} readings in "
+                f"the window, so use {needed:g} s or more - otherwise every "
+                "set point would time out even with a perfectly steady bath.")
+    interval = float(profile.get("sample_interval") or 0)
+    if poll_interval and 0 < interval < float(poll_interval):
+        problems.append(
+            f"Samples are requested every {interval:g} s but the 286 is only "
+            f"scanned every {poll_interval:g} s, so samples would repeat. "
+            f"Use {poll_interval:g} s or more.")
     return problems
 
 
@@ -234,7 +254,8 @@ class RunEngine:
         if self.is_active:
             raise RuntimeError("This run is already going.")
         problems = validate_profile(self.profile, self.heat_source,
-                                    self.adt.channels or None)
+                                    self.adt.channels or None,
+                                    getattr(self.adt, "poll_interval", None))
         if problems:
             raise ValueError("; ".join(problems))
         self.registry.claim(self.run_id, self.channels)
@@ -291,7 +312,16 @@ class RunEngine:
         while not self._stop.is_set():
             elapsed = time.time() - start
             if elapsed > max_wait:
-                return False, elapsed, "stability timeout"
+                if len(history) < 3:
+                    return (False, elapsed,
+                            "stability timeout - only "
+                            f"{len(history)} reading(s) fell inside the "
+                            f"{window:g}s window, so it could never be "
+                            "judged; lengthen the window or scan faster")
+                values = [v for _, v in history]
+                return (False, elapsed,
+                        f"stability timeout - last span "
+                        f"{max(values) - min(values):.4f} vs band {band:g}")
             last_cycle, reading = self._fresh_reference(last_cycle)
             if reading is None:
                 if self._stop.is_set():
