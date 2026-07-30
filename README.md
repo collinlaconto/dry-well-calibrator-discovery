@@ -3,36 +3,54 @@
 Automated multi-point temperature calibration: the PC drives the heat sources,
 the ADT286 does the measuring, and several calibrations can run at once.
 
+## Install and run
+
+Put **all nine .py files in one folder** — no subfolders needed — then:
+
 ```
 pip install pyserial
 python run_calibration_suite.py
 ```
 
-`heat_source_discovery.py` (the standalone format-discovery tool) still runs on
-its own and writes `heat_source_profiles.json`. **Keep both in the same folder** —
-the suite reads that same library, so a heat source you verify once shows up
-ready to use.
+```
+your-folder/
+    run_calibration_suite.py     <- start this one
+    ui.py  engine.py  adt286.py  heatsource.py
+    transport.py  formats.py  export.py
+    heat_source_discovery.py     <- the standalone format tool
+```
+
+The launcher accepts either this flat layout or a `calsuite/` subfolder, so it
+works however the files end up on disk. If any are missing it names them rather
+than throwing an import error. Profile libraries
+(`heat_source_profiles.json`, `calibration_profiles.json`) are written next to
+the launcher, which is also how the discovery tool and the suite share heat
+source formats — verify a well once, and it appears ready to use.
+
+Python needs tkinter for the window. It ships with the python.org installers
+(keep "tcl/tk and IDLE" checked); on Debian/Ubuntu it's `sudo apt install
+python3-tk`.
 
 ## Why this gets around the 286's one-profile limit
 
 The 286's built-in Probe Calibration app runs one profile at a time. This suite
 inverts the arrangement: the PC owns the sequencing and drives each heat source
 directly over its own serial port, while the 286 is used purely as the readout.
-The heat sources never need to be presets on the 286 at all, which also sidesteps
-the Temperature Source Management gap entirely.
+The heat sources never need to be presets on the 286 at all, which also
+sidesteps the Temperature Source Management gap entirely.
 
 **The one real constraint** is that the 286 has a single scan configuration —
 `SCAN:MULT:STARt` takes one channel list, so concurrent runs cannot each start
-their own scan. The suite handles this by having every run *subscribe* its
-channels to one shared scan; readings are then fanned out by channel name. One
-poll serves everyone. Consequences worth knowing:
+their own scan. Every run *subscribes* its channels to one shared scan and
+readings are fanned out by channel name; one poll serves everyone.
+Consequences worth knowing:
 
 - **Channels are locked to a run while it is active.** A `ChannelRegistry`
   refuses to start a run whose reference or DUT channel is already claimed, so
   two runs can never read each other's probes.
 - **Starting or finishing a run reconfigures the shared scan**, which pauses
   data for about a second. Harmless — the engine waits for fresh scan cycles —
-  but it is why the scan restarts appear in the log.
+  but it is why scan restarts appear in the log.
 - **The suite never changes the 286's channel setup or units.** Those are
   global, so changing them mid-flight would corrupt another run's data. Set
   sensor types on the instrument beforehand; the suite reads and displays them

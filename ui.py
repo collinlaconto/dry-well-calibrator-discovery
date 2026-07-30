@@ -20,7 +20,11 @@ from .transport import SERIAL_OK, SERIAL_ERROR, available_ports
 
 APP_TITLE = "Temperature Calibration Suite — ADT286 + heat sources"
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.dirname(HERE)
+# Profile libraries live beside run_calibration_suite.py. That is HERE's
+# parent when the modules are in a calsuite/ folder, and HERE itself when
+# they sit flat beside the launcher.
+DATA_DIR = (os.path.dirname(HERE) if os.path.basename(HERE) == "calsuite"
+            else HERE)
 SOURCE_LIB = os.path.join(DATA_DIR, "heat_source_profiles.json")
 RUN_LIB = os.path.join(DATA_DIR, "calibration_profiles.json")
 
