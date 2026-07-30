@@ -404,6 +404,7 @@ class SuiteApp(tk.Tk):
         self._build_profiles_tab()
         self._build_runs_tab()
         self._build_results_tab()
+        self._build_terminal_tab()
 
         bar = ttk.LabelFrame(self, text="Activity")
         bar.pack(fill="both", padx=8, pady=(0, 8))
@@ -671,6 +672,128 @@ class SuiteApp(tk.Tk):
         self.plot = PlotCanvas(t, height=300)
         self.plot.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
+    # --- tab 5: terminal ---------------------------------------------------
+    def _build_terminal_tab(self):
+        t = ttk.Frame(self.nb)
+        self.nb.add(t, text=" 5 · Terminal ")
+        bar = ttk.Frame(t)
+        bar.pack(fill="x", padx=8, pady=8)
+        ttk.Label(bar, text="Instrument").pack(side="left")
+        self.var_term_target = tk.StringVar()
+        self.cbo_term_target = ttk.Combobox(bar,
+                                            textvariable=self.var_term_target,
+                                            width=32, state="readonly")
+        self.cbo_term_target.pack(side="left", padx=6)
+        ttk.Button(bar, text="Refresh list",
+                   command=self._refresh_terminal_targets).pack(side="left")
+        self.var_term_err = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bar, text="Check SYSTem:ERRor? after every command",
+                        variable=self.var_term_err).pack(side="left", padx=12)
+
+        row = ttk.Frame(t)
+        row.pack(fill="x", padx=8, pady=4)
+        ttk.Label(row, text="Command").pack(side="left")
+        self.var_term_cmd = tk.StringVar()
+        ent = ttk.Entry(row, textvariable=self.var_term_cmd)
+        ent.pack(side="left", fill="x", expand=True, padx=6)
+        ent.bind("<Return>", lambda e: self._terminal_send())
+        ttk.Button(row, text="Send",
+                   command=self._terminal_send).pack(side="left")
+
+        ttk.Label(t, foreground="#555", wraplength=1000, justify="left",
+                  text=("Hand-test commands on any connected instrument, over "
+                        "whichever connection it uses. Additel documents "
+                        "SYSTem:ERRor? as the way to tell whether a command "
+                        "that returns nothing was accepted: 0 means it was, "
+                        "-110 means the instrument did not recognise the "
+                        "command header. Queries end in '?'.")
+                  ).pack(fill="x", padx=10, pady=(0, 4))
+
+        quick = ttk.LabelFrame(t, text="Quick tries")
+        quick.pack(fill="x", padx=8, pady=4)
+        for label, cmd in (("Identity", "*IDN?"),
+                           ("Additel set point", "TEMPerature:TARGet?"),
+                           ("Additel temperature", "TEMPerature?"),
+                           ("Additel control", "TEMPerature:MODE?"),
+                           ("Fluke set point", "SOUR:SPO?"),
+                           ("Error queue", "SYSTem:ERRor?")):
+            ttk.Button(quick, text=label,
+                       command=lambda c=cmd: (self.var_term_cmd.set(c),
+                                              self._terminal_send())
+                       ).pack(side="left", padx=4, pady=4)
+
+        self.log_terminal = scrolledtext.ScrolledText(t, height=18,
+                                                      wrap="word")
+        self.log_terminal.pack(fill="both", expand=True, padx=8, pady=6)
+        for tag, colour in (("TX", "#0b5cad"), ("RX", "#20603d"),
+                            ("PASS", "#1a7f37"), ("FAIL", "#b00020"),
+                            ("WARN", "#9a6700"), ("INFO", "#444")):
+            self.log_terminal.tag_config(tag, foreground=colour)
+        self.log_terminal.configure(state="disabled")
+
+    def _refresh_terminal_targets(self):
+        names = (["ADT286"] if self.adt.is_open else []) + list(self.sources)
+        self.cbo_term_target["values"] = names
+        if names and self.var_term_target.get() not in names:
+            self.var_term_target.set(names[0])
+
+    def _term_link(self):
+        """(link, lock, name) for the instrument selected on the terminal."""
+        choice = self.var_term_target.get()
+        if choice == "ADT286":
+            if not self.adt.is_open:
+                return (None, None, "ADT286")
+            return (self.adt.link, self.adt.lock, "ADT286")
+        source = self.sources.get(choice)
+        if source is None or not source.is_open:
+            return (None, None, choice)
+        return (source.link, source.lock, source.name)
+
+    def _term_log(self, tag, message):
+        widget = self.log_terminal
+        widget.configure(state="normal")
+        widget.insert("end", f"[{tag}] {message}\n", tag)
+        widget.see("end")
+        widget.configure(state="disabled")
+
+    def _terminal_send(self):
+        cmd = self.var_term_cmd.get().strip()
+        if not cmd:
+            return
+        self._refresh_terminal_targets()
+        link, lock, name = self._term_link()
+        if link is None:
+            messagebox.showerror(
+                "Terminal",
+                f"{name} is not connected. Connect it on the Instruments tab "
+                "first.")
+            return
+        check = bool(self.var_term_err.get())
+
+        def work():
+            try:
+                with lock:
+                    self._term_log("TX", f"{name}  <-  {cmd}")
+                    is_query = cmd.rstrip().endswith("?")
+                    reply = (link.query(cmd) if is_query
+                             else (link.write(cmd) or ""))
+                    self._term_log("RX", reply if reply
+                                   else "(no reply)")
+                    if check and not cmd.upper().startswith("SYST"):
+                        err = link.query("SYSTem:ERRor?")
+                        if not err:
+                            self._term_log("WARN",
+                                           "SYSTem:ERRor? gave nothing - this "
+                                           "instrument may not keep an error "
+                                           "queue.")
+                        elif err.strip().startswith("0"):
+                            self._term_log("PASS", f"accepted ({err})")
+                        else:
+                            self._term_log("FAIL", f"rejected ({err})")
+            except Exception as e:
+                self._term_log("FAIL", str(e))
+        threading.Thread(target=work, daemon=True).start()
+
     # -------------------------------------------------------------- ports --
     def _refresh_ports(self):
         for picker in (getattr(self, "pick_adt", None),
@@ -715,6 +838,7 @@ class SuiteApp(tk.Tk):
         self.lst_channels.delete(0, "end")
         for c in self.adt.channels:
             self.lst_channels.insert("end", self.adt.describe(c))
+        self._refresh_terminal_targets()
         self.cbo_p_ref["values"] = self.adt.channels
         self.lst_p_duts.delete(0, "end")
         for c in self.adt.channels:
@@ -774,6 +898,7 @@ class SuiteApp(tk.Tk):
         self.sources[name] = source
         self._refresh_source_table()
         self.cbo_p_source["values"] = list(self.sources)
+        self._refresh_terminal_targets()
         if not self.var_p_source.get():
             self.var_p_source.set(name)
         for item in source.family_checklist():

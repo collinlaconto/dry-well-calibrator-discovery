@@ -62,20 +62,44 @@ Ethernet.
 These default to a **network** connection when added, with ranges pre-filled
 (-40 to 160 °C and 33 to 700 °C).
 
-Their command syntax is deliberately **left blank**, because I could not
-verify Additel's exact SCPI wording from the documentation — and a wrong
-command sitting silently in a profile is worse than an empty one. Instead:
+**Additel does not use standard SCPI `SOURce:` naming.** In their published
+command sets the root keyword is the measured quantity itself: their pressure
+controller uses `PRESsure:TARGet <value>` for the set point and
+`PRESsure:MODE` for control state — there is no `SOURce` subsystem at all.
+That is why Fluke-style commands like `SOUR:SPO` are simply not recognised by
+an Additel well. The suite now tries Additel-style forms first:
 
-1. Connect the well on the Instruments tab.
-2. Select it in the table and press **Check / discover commands**.
+```
+TEMPerature:TARGet?      TEMP:TARG?          set point (read)
+TEMPerature:TARGet <v>                       set point (write)
+TEMPerature?             TEMP?               live temperature
+UNIT:TEMPerature?                            unit
+TEMPerature:MODE?  / TEMPerature:MODE 1|0    heat/cool control
+```
 
-That probes candidate commands live, adopts whatever the instrument actually
-answers to, and confirms the set-point write by changing it slightly and
-reading it back — then restores the original value. The output enable is
-never sent. Whatever it proves is saved to `heat_source_profiles.json`, so it
-is a one-time step per instrument. Anything it cannot find is named plainly,
-with the Activity log showing every command tried, so you can fill the gap
-from Additel's "Programming Commands for 878" PDF.
+These are inferred from Additel's house style, not copied from the 878
+document, so **confirm them with Check / discover commands** rather than
+trusting them. Additel documents `SYSTem:ERRor?` as the way to tell whether a
+command was accepted, and discovery uses exactly that: it sends deliberate
+nonsense first to confirm the error queue works, then confirms every
+candidate with it. That is the only reliable way to test a command that
+returns nothing. Where an instrument has no error queue, it falls back to
+judging by replies.
+
+Discovery is safe: only the set-point write changes anything, by a small
+delta that is then restored, and the heat/cool command is found from its
+read-only query form and never actuated.
+
+### If discovery still comes up empty
+
+Use the **Terminal** tab. Pick the instrument, type a command, and it shows
+the reply plus the `SYSTem:ERRor?` verdict — `0` means accepted, `-110`
+means the instrument did not recognise the command header. There are
+one-click buttons for the Additel and Fluke forms. Working through a few
+candidates there will find the syntax in a couple of minutes, and the
+authoritative list is in Additel's "Programming Commands for 878" PDF on
+their Product Resources page (support can email it if the download is
+blocked).
 
 ## Why this gets around the 286's one-profile limit
 

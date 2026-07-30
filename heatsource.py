@@ -8,8 +8,9 @@ profile's range raises rather than being clamped.
 import threading
 import time
 
-from .formats import (FAMILIES, SP_READ_CANDIDATES, TERMINATORS,
-                      UNIT_CANDIDATES, VALUE_CANDIDATES,
+from .formats import (CONTROL_PAIRS, ERROR_QUERY, FAMILIES,
+                      NONSENSE_COMMAND, SP_READ_CANDIDATES, STABLE_CANDIDATES,
+                      TERMINATORS, UNIT_CANDIDATES, VALUE_CANDIDATES,
                       WRITE_PAIRS, first_float)
 from .transport import (describe_target, make_link, normalize_target,
                         target_is_set)
@@ -170,54 +171,117 @@ class HeatSource:
         return list(fam.get("checklist", []))
 
     # ------------------------------------------------------ verification ----
+    # ------------------------------------------------------- discovery ----
+    def _error_code(self):
+        """Read the error queue. Returns (code, text) or (None, '')."""
+        try:
+            reply = self.link.query(ERROR_QUERY)
+        except Exception:
+            return (None, "")
+        if not reply:
+            return (None, "")
+        head = reply.split(",", 1)[0].strip()
+        try:
+            return (int(head), reply)
+        except ValueError:
+            return (None, reply)
+
+    def _has_error_queue(self):
+        """True if the instrument reports errors for bad commands.
+
+        Additel documents SYSTem:ERRor? as the way to check whether a control
+        command was accepted, which makes discovery far more reliable than
+        guessing from replies. Confirm it works by sending deliberate
+        nonsense and checking that it complains.
+        """
+        try:
+            self.link.write("*CLS")
+        except Exception:
+            return False
+        code, _ = self._error_code()
+        if code is None:
+            return False
+        try:
+            self.link.query(NONSENSE_COMMAND)
+        except Exception:
+            return False
+        code, _ = self._error_code()
+        return code is not None and code != 0
+
+    def _accepted(self, command, use_errors, expect_reply=True):
+        """Send one candidate. Returns (accepted, reply)."""
+        try:
+            if use_errors:
+                self.link.write("*CLS")
+            reply = (self.link.query(command) if expect_reply
+                     else (self.link.write(command) or ""))
+        except Exception:
+            return (False, "")
+        if use_errors:
+            code, _text = self._error_code()
+            if code is not None:
+                return (code == 0, reply)
+        # No usable error queue: a parseable reply is the only evidence.
+        return (bool(reply), reply)
+
     def verify_commands(self, test_delta=0.5, restore=True, log=None):
         """Probe candidate commands live and adopt whatever the instrument
-        actually answers.
+        actually answers to.
 
-        This is how a heat source whose syntax isn't documented (the Additel
-        878s, for instance) gets a working profile: nothing is assumed, each
-        command has to prove itself on the instrument. Only the set-point write
-        makes a change, by a small delta that is then restored, and the output
-        enable is never sent.
+        Two dialects are tried: standard SCPI SOURce naming (Fluke wells) and
+        Additel's own style, where the root keyword is the quantity itself
+        (TEMPerature:TARGet rather than SOURce:SPOint). Where the instrument
+        keeps an error queue, each candidate is confirmed with SYSTem:ERRor?
+        -- which is the only reliable way to test a command that returns
+        nothing.
 
-        Returns a report dict; adopted commands are written into the profile.
+        Only the set-point write changes anything, by a small delta that is
+        then restored. The heat/cool control command is discovered from its
+        read-only query form and never actuated.
         """
         say = log or (lambda tag, msg: self.log(tag, msg))
         if not self.is_open:
             raise RuntimeError(f"{self.name} is not connected.")
-        report = {"idn": "", "adopted": {}, "failed": [], "verified": False}
+        report = {"idn": "", "adopted": {}, "failed": [], "verified": False,
+                  "error_queue": False, "tried": []}
 
         with self.lock:
             report["idn"] = self.idn or self.link.query("*IDN?")
             say("INFO", f"{self.name} identifies as: "
                         f"{report['idn'] or '(no reply)'}")
 
-            def try_candidates(label, candidates, parser):
-                for cmd in candidates:
-                    if not cmd:
-                        continue
-                    reply = self.link.query(cmd)
-                    value = parser(reply) if reply else None
-                    if value is not None and value != "":
-                        say("PASS", f"{label}: {cmd!r} works (reply {reply!r})")
-                        return cmd, value
-                    say("INFO", f"{label}: {cmd!r} - no usable reply")
-                say("FAIL", f"{label}: nothing worked. Enter it by hand, or "
-                            "check the instrument's command document.")
-                report["failed"].append(label)
-                return None, None
+            use_errors = self._has_error_queue()
+            report["error_queue"] = use_errors
+            say("INFO", "Error queue works - each command will be confirmed "
+                        "with SYSTem:ERRor?."
+                        if use_errors else
+                        "No usable error queue; judging commands by their "
+                        "replies alone.")
 
-            # order: whatever the profile already has, then family, then generic
             fam = FAMILIES.get(self.profile.get("family") or "unknown", {})
             fam_cmds = fam.get("commands") or {}
 
             def order(key, generic):
                 seen, out = set(), []
-                for cmd in ([self._cmd(key), fam_cmds.get(key)] + list(generic)):
+                for cmd in ([self._cmd(key), fam_cmds.get(key)]
+                            + list(generic)):
                     if cmd and cmd not in seen:
                         seen.add(cmd)
                         out.append(cmd)
                 return out
+
+            def try_candidates(label, candidates, parser):
+                for cmd in candidates:
+                    accepted, reply = self._accepted(cmd, use_errors)
+                    report["tried"].append((label, cmd, reply))
+                    value = parser(reply) if reply else None
+                    if accepted and value is not None and value != "":
+                        say("PASS", f"{label}: {cmd!r} works (reply {reply!r})")
+                        return cmd, value
+                    say("INFO", f"{label}: {cmd!r} - no")
+                say("FAIL", f"{label}: nothing worked.")
+                report["failed"].append(label)
+                return None, None
 
             sp_read, original = try_candidates(
                 "Set-point read", order("sp_read", SP_READ_CANDIDATES),
@@ -237,12 +301,35 @@ class HeatSource:
             if unit_cmd:
                 report["adopted"]["unit"] = unit_cmd
 
-            # set-point write: only meaningful if we can read it back
+            # Heat/cool control: probe the query form only, never actuate.
+            for query, (on_cmd, off_cmd) in CONTROL_PAIRS.items():
+                accepted, reply = self._accepted(query, use_errors)
+                report["tried"].append(("Output control", query, reply))
+                if accepted and reply:
+                    report["adopted"]["enable"] = on_cmd
+                    report["adopted"]["disable"] = off_cmd
+                    say("PASS", f"Output control: {query!r} answers {reply!r} "
+                                f"-> using {on_cmd!r} / {off_cmd!r}")
+                    break
+            else:
+                say("WARN", "No remote heat/cool control command found. "
+                            "Switch the output on at the front panel, or the "
+                            "instrument will not drive to its set points.")
+
+            for cmd in STABLE_CANDIDATES:
+                accepted, reply = self._accepted(cmd, use_errors)
+                if accepted and reply:
+                    say("INFO", f"Instrument also reports its own stability "
+                                f"via {cmd!r} ({reply!r}). The suite still "
+                                "judges stability from the reference probe.")
+                    break
+
+            # Set-point write: only meaningful if we can read it back.
             if sp_read and original is not None:
-                write = self._cmd("sp_write") or fam_cmds.get("sp_write") \
-                    or WRITE_PAIRS.get(sp_read)
+                write = (self._cmd("sp_write") or fam_cmds.get("sp_write")
+                         or WRITE_PAIRS.get(sp_read))
                 if not write:
-                    say("FAIL", "Set-point write: no known pairing for "
+                    say("FAIL", f"Set-point write: no known pairing for "
                                 f"{sp_read!r}; enter it by hand.")
                     report["failed"].append("Set-point write")
                 else:
@@ -257,24 +344,45 @@ class HeatSource:
                                     "change; write command not verified.")
                         report["adopted"]["sp_write"] = write
                     else:
-                        self.link.write(write.replace("{value}",
-                                                      f"{target:.2f}"))
+                        accepted, _ = self._accepted(
+                            write.replace("{value}", f"{target:.2f}"),
+                            use_errors, expect_reply=False)
                         time.sleep(0.4)
                         rb = first_float(self.link.query(sp_read))
-                        if rb is not None and abs(rb - target) <= 0.05:
+                        good = (rb is not None and abs(rb - target) <= 0.05)
+                        if good:
                             say("PASS", f"Set-point write: {write!r} verified "
                                         f"(wrote {target:.2f}, read {rb}).")
                             report["adopted"]["sp_write"] = write
                             report["verified"] = True
+                        elif rb is None:
+                            # No reply at all: distinguish a dropped link
+                            # from a rejected command before blaming a lock.
+                            alive = bool(self.link.query("*IDN?"))
+                            if alive:
+                                say("FAIL", f"Set-point write: wrote "
+                                            f"{target:.2f} but the set point "
+                                            "could not be read back. The "
+                                            "command may have been rejected.")
+                            else:
+                                say("FAIL", "The instrument stopped "
+                                            "responding during the set-point "
+                                            "test - the connection dropped. "
+                                            "Reconnect and try again; nothing "
+                                            "here says the command is wrong.")
+                                report["link_lost"] = True
+                            report["failed"].append("Set-point write")
+                            report["adopted"]["sp_write"] = write
                         else:
-                            say("FAIL", f"Set-point write: wrote {target:.2f} "
-                                        f"but read back {rb}. The set point "
-                                        "may be locked on the instrument.")
+                            say("FAIL", f"Set-point write: wrote "
+                                        f"{target:.2f} but read back {rb}. "
+                                        "The set point may be locked on the "
+                                        "instrument.")
                             report["failed"].append("Set-point write")
                             report["adopted"]["sp_write"] = write
                         if restore:
-                            self.link.write(write.replace("{value}",
-                                                          f"{original:.2f}"))
+                            self.link.write(
+                                write.replace("{value}", f"{original:.2f}"))
                             time.sleep(0.3)
                             say("INFO", f"Set point restored to {original:g}.")
 

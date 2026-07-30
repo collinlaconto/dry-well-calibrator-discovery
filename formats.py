@@ -133,19 +133,61 @@ KNOWN_MODELS = {
 }
 
 
-# Candidates tried by HeatSource.verify_commands when a profile has no
-# proven command set. Ordered most-likely-first. Nothing here is asserted to
-# be correct for any particular instrument -- the point is to find out which
-# one it actually answers.
-SP_READ_CANDIDATES = ("SOUR:SPO?", "SOUR:SPOint?", "SOUR:TEMP:SPO?",
-                      "SOUR:SPO:TEMP?", "SETP?", "SP?", "s")
-VALUE_CANDIDATES = ("SOUR:SENS:DAT? TEMP", "SOUR:SENS:DATA?", "MEAS:TEMP?",
-                    "MEAS?", "SOUR:TEMP?", "t")
-UNIT_CANDIDATES = ("UNIT:TEMP?", "UNIT:TEMPerature?", "u")
-ENABLE_CANDIDATES = ("OUTP:STAT 1", "OUTP:STATe ON")
+# Candidates tried by HeatSource.verify_commands.
+#
+# Two dialects live here. Fluke/Hart wells use standard SCPI SOURce naming
+# (SOUR:SPO). Additel does NOT: in their published command sets the root
+# keyword is the measured quantity, so a pressure controller uses
+# "PRESsure:TARGet <value>" and "PRESsure:MODE", with no SOURce subsystem at
+# all. The TEMPerature:* forms below are that same pattern applied to a
+# temperature source -- inferred from Additel's house style, which is exactly
+# why they are probed and confirmed rather than assumed.
+SP_READ_CANDIDATES = (
+    # Additel style
+    "TEMPerature:TARGet?", "TEMP:TARG?",
+    "SOURce:TEMPerature:TARGet?", "TEMPerature:SPOint?",
+    # Fluke / standard SCPI style
+    "SOUR:SPO?", "SOUR:SPOint?", "SOUR:TEMP:SPO?", "SOUR:SPO:TEMP?",
+    "SETP?", "SP?",
+    # Hart classic serial
+    "s",
+)
+
+VALUE_CANDIDATES = (
+    # Additel style: the bare quantity reads the live value
+    "TEMPerature?", "TEMP?", "TEMPerature:VALue?",
+    "MEASure:TEMPerature?",
+    # Fluke / standard SCPI style
+    "SOUR:SENS:DAT? TEMP", "SOUR:SENS:DATA?", "MEAS:TEMP?", "MEAS?",
+    "SOUR:TEMP?",
+    # Hart classic serial
+    "t",
+)
+
+UNIT_CANDIDATES = ("UNIT:TEMPerature?", "UNIT:TEMP?",
+                   "TEMPerature:UNIT?", "u")
+
+# Read-only queries used to find the heat/cool control command. Only the
+# QUERY form is ever sent during discovery, so probing can never start the
+# instrument heating; the paired writes are inferred from whichever answers.
+CONTROL_PAIRS = {
+    "TEMPerature:MODE?": ("TEMPerature:MODE 1", "TEMPerature:MODE 0"),
+    "TEMP:MODE?": ("TEMP:MODE 1", "TEMP:MODE 0"),
+    "TEMPerature:CONTrol?": ("TEMPerature:CONTrol 1",
+                             "TEMPerature:CONTrol 0"),
+    "OUTP:STAT?": ("OUTP:STAT 1", "OUTP:STAT 0"),
+    "OUTPut:STATe?": ("OUTPut:STATe ON", "OUTPut:STATe OFF"),
+}
+
+# Optional extras worth knowing about if the instrument offers them.
+STABLE_CANDIDATES = ("TEMPerature:STABle?", "TEMP:STAB?", "SOUR:STAB:COND?")
 
 # A verified set-point read implies its paired write command.
 WRITE_PAIRS = {
+    "TEMPerature:TARGet?": "TEMPerature:TARGet {value}",
+    "TEMP:TARG?": "TEMP:TARG {value}",
+    "SOURce:TEMPerature:TARGet?": "SOURce:TEMPerature:TARGet {value}",
+    "TEMPerature:SPOint?": "TEMPerature:SPOint {value}",
     "SOUR:SPO?": "SOUR:SPO {value}",
     "SOUR:SPOint?": "SOUR:SPOint {value}",
     "SOUR:TEMP:SPO?": "SOUR:TEMP:SPO {value}",
@@ -154,6 +196,13 @@ WRITE_PAIRS = {
     "SP?": "SP {value}",
     "s": "s={value}",
 }
+
+# Sent to see whether the instrument keeps a usable error queue. Additel
+# documents SYSTem:ERRor? as the way to check whether a control command was
+# accepted, which makes discovery far more reliable than guessing from
+# replies alone.
+ERROR_QUERY = "SYSTem:ERRor?"
+NONSENSE_COMMAND = "ZZQQ:NOSUCH?"
 
 
 def first_float(text):
