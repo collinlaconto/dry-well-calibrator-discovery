@@ -119,8 +119,15 @@ To use it in a hand-written profile, just put `{unit}` in `sp_write` inside
 
 ### If discovery still comes up empty
 
-Use the **Terminal** tab. Pick the instrument, type a command, and it shows
-the reply plus the `SYSTem:ERRor?` verdict — `0` means accepted, `-110`
+Use the **Terminal** tab. Its **Read set point / Read temperature / Read
+unit** buttons send whichever command that instrument actually uses, taken
+from its own profile rather than a hard-coded guess — so they work on an
+Additel well and a Fluke well alike, and say so plainly when a command has not
+been found yet. The **Find … command** buttons sweep every known form, report
+each verdict, and save the one that answers.
+
+You can also type any command directly: it shows the reply plus the
+`SYSTem:ERRor?` verdict — `0` means accepted, `-110`
 means the instrument did not recognise the command header. There are
 one-click buttons for the Additel and Fluke forms. Working through a few
 candidates there will find the syntax in a couple of minutes, and the
@@ -192,6 +199,23 @@ tolerates the longer thermocouple form with cold-junction blocks appended.
 Fluke 917X and 6109A/7109A command sets are from their manuals. The classic
 Micro-Bath syntax (`t`, `s=`, `u`) is convention-derived, and the Additel 878
 syntax is left to live discovery — verify both before trusting a run to them.
+
+## Using the 286 by hand during a run
+
+The 286 keeps a single scan configuration, so switching its display to
+another function cancels the scan and readings stop. The suite watches for
+that: after a few polls with no data (or with subscribed channels missing) it
+re-sends `SCAN:MULT:STARt` and carries on. Recovery is rate-limited so it
+cannot become a restart storm, it is announced in the Activity log, and the
+Runs tab shows live scan health ("scanning", "no data - recovering",
+"recovered 2x"). Runs survive the interruption; a stability window simply
+takes a little longer to fill.
+
+You can also slow the scan down — **Read channels every** on the Instruments
+tab (0.5 / 1 / 2 / 5 / 10 s) — which leaves the instrument freer for hands-on
+use. Remember the stability window must stay at least three read intervals
+long; changing the rate says what the new minimum is, and warns if a running
+profile's window has become too short.
 
 ## Several identical wells
 

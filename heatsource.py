@@ -12,7 +12,7 @@ from .formats import (CONTROL_PAIRS, ERROR_QUERY, FAMILIES,
                       NONSENSE_COMMAND, SP_READ_CANDIDATES, STABLE_CANDIDATES,
                       TERMINATORS, UNIT_CANDIDATES, VALUE_CANDIDATES,
                       WRITE_PAIRS, describe_unit_token, first_float,
-                      second_field, unit_token_for)
+                      plausible_unit_token, second_field, unit_token_for)
 from .transport import (describe_target, make_link, normalize_target,
                         target_is_set)
 
@@ -114,6 +114,8 @@ class HeatSource:
     def _capture_unit(self, reply):
         """Remember the unit the instrument reports alongside a value."""
         token = second_field(reply)
+        if token and not plausible_unit_token(token):
+            return reply          # another number, not a unit - ignore it
         if token and token != self.unit_token:
             self.unit_token = token
             self.profile["unit_token"] = token
@@ -219,6 +221,50 @@ class HeatSource:
         if lo is None or hi is None:
             return []
         return [sp for sp in setpoints if not (lo <= sp <= hi)]
+
+    def sweep(self, kind, log=None):
+        """Try every candidate for one field and adopt the first that works.
+
+        Used from the Terminal when a command could not be found
+        automatically. Read-only: only queries are sent.
+        """
+        say = log or (lambda tag, msg: self.log(tag, msg))
+        lists = {"value": VALUE_CANDIDATES, "sp_read": SP_READ_CANDIDATES,
+                 "unit": UNIT_CANDIDATES}
+        labels = {"value": "current temperature", "sp_read": "set point",
+                  "unit": "unit"}
+        candidates = lists.get(kind)
+        if candidates is None:
+            raise ValueError(f"Nothing to sweep for {kind!r}.")
+        if not self.is_open:
+            raise RuntimeError(f"{self.name} is not connected.")
+        parser = (lambda r: (r or "").strip()) if kind == "unit" else first_float
+        results, winner = [], None
+        with self.lock:
+            use_errors = self._has_error_queue()
+            for cmd in candidates:
+                accepted, reply = self._accepted(cmd, use_errors)
+                good = accepted and parser(reply) not in (None, "")
+                results.append((cmd, reply, good))
+                say("PASS" if good else "INFO",
+                    f"{cmd}  ->  {reply!r}" + ("" if good else "   (no)"))
+                if good and winner is None:
+                    winner = cmd
+                    if kind in ("sp_read", "value"):
+                        self._capture_unit(reply)
+        if winner:
+            self.profile[kind] = winner
+            if kind == "sp_read":
+                paired = WRITE_PAIRS.get(winner)
+                if paired and not self._cmd("sp_write"):
+                    self.profile["sp_write"] = paired
+            say("PASS", f"Adopted {winner!r} as the "
+                        f"{labels[kind]} command.")
+        else:
+            say("FAIL", f"No candidate worked for the {labels[kind]}. "
+                        "Check Additel's programming-commands PDF and type "
+                        "the command here to test it.")
+        return {"winner": winner, "results": results}
 
     def family_checklist(self):
         fam = FAMILIES.get(self.profile.get("family") or "unknown")

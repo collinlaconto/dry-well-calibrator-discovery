@@ -198,6 +198,15 @@ class Adt286:
         self._poll_thread = None
         self.poll_interval = 1.0
         self.last_error = ""
+        # Scan watchdog. The 286 keeps ONE scan configuration, and moving to
+        # another function on its display tears that scan down -- readings
+        # simply stop. Rather than going blind, notice and re-establish it.
+        self.recover_after = 3          # consecutive bad polls before acting
+        self.recover_min_gap = 5.0      # seconds between recovery attempts
+        self._bad_polls = 0
+        self._last_recovery = 0.0
+        self.recoveries = 0
+        self.on_recovery = None         # optional callback(message)
 
     # ------------------------------------------------------------ session --
     @property
@@ -320,6 +329,7 @@ class Adt286:
         cmd = f'SCAN:MULT:STARt {self.scan_rate},"{",".join(chans)}"'
         try:
             self.link.write(cmd)
+            self._bad_polls = 0
             self.log("INFO", f"Scanning {len(chans)} channel(s): "
                              f"{', '.join(chans)}")
         except Exception as e:
@@ -339,6 +349,30 @@ class Adt286:
         if t and t.is_alive():
             t.join(timeout=3.0)
 
+    def _note_bad_poll(self, reason):
+        """Count a poll that produced nothing usable; recover if persistent."""
+        self._bad_polls += 1
+        if self._bad_polls < self.recover_after:
+            return False
+        now = time.time()
+        if now - self._last_recovery < self.recover_min_gap:
+            return False
+        self._last_recovery = now
+        self.recoveries += 1
+        message = (f"The 286 stopped returning scan data ({reason}). This "
+                   "normally means its display was switched to another "
+                   "function, which cancels the scan. Re-establishing it - "
+                   "runs in progress will carry on.")
+        self.log("WARN", message)
+        if self.on_recovery:
+            try:
+                self.on_recovery(message)
+            except Exception:
+                pass
+        self._restart_scan()
+        self._bad_polls = 0
+        return True
+
     def poll_once(self):
         """One scan read. Returns the number of channels updated."""
         if (self.link is None or not self.link.is_open
@@ -349,10 +383,22 @@ class Adt286:
                 payload = self.link.query("SCAN:DATA:Last?")
             except Exception as e:
                 self.last_error = str(e)
+                self._note_bad_poll("the connection returned an error")
                 return 0
             data = parse_scan_data(payload)
             if not data:
+                self._note_bad_poll("no readings came back")
                 return 0
+            missing = [c for c in self.subscribed_channels() if c not in data]
+            if missing:
+                # The scan is running but no longer covers what we asked for.
+                self._note_bad_poll(
+                    f"{len(missing)} subscribed channel(s) missing from the "
+                    "scan")
+                if len(missing) == len(self.subscribed_channels()):
+                    return 0
+            else:
+                self._bad_polls = 0
             self._cycle += 1
             now = time.time()
             for name, vals in data.items():
@@ -384,6 +430,20 @@ class Adt286:
     def cycle(self):
         with self.lock:
             return self._cycle
+
+    @property
+    def health(self):
+        """Short description of scan health, for the run screen."""
+        if self.link is None or not self.link.is_open:
+            return "not connected"
+        if not self.subscribed_channels():
+            return "idle (no run subscribed)"
+        if self._bad_polls:
+            return f"no data for {self._bad_polls} poll(s) - recovering"
+        base = "scanning"
+        if self.recoveries:
+            base += f" (recovered {self.recoveries}x)"
+        return base
 
     def system_error(self):
         with self.lock:

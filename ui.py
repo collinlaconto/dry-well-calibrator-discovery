@@ -311,6 +311,7 @@ class SuiteApp(tk.Tk):
         self.minsize(1000, 700)
 
         self.adt = Adt286(logger=self._instrument_log)
+        self.adt.on_recovery = lambda msg: self._log("WARN", msg)
         self.registry = ChannelRegistry()
         self.sources = {}            # name -> HeatSource
         self.run_profiles = self._load(RUN_LIB, [])
@@ -376,6 +377,14 @@ class SuiteApp(tk.Tk):
         except queue.Empty:
             pass
         self._refresh_run_table()
+        try:
+            health = self.adt.health
+            colour = ("#b00020" if "no data" in health
+                      else "#9a6700" if "recovered" in health else "#444")
+            self.lbl_scan.configure(text=f"286 scan: {health}",
+                                    foreground=colour)
+        except Exception:
+            pass
         self.after(300, self._drain)
 
     def _handle_event(self, ev):
@@ -436,13 +445,25 @@ class SuiteApp(tk.Tk):
         self.lbl_adt = ttk.Label(btns, text="Not connected",
                                  foreground="#b00020")
         self.lbl_adt.pack(side="left", padx=10)
+        ttk.Label(btns, text="   Read channels every").pack(side="left")
+        self.var_poll = tk.StringVar(value="1")
+        ttk.Combobox(btns, textvariable=self.var_poll, width=5,
+                     state="readonly",
+                     values=["0.5", "1", "2", "5", "10"]).pack(side="left",
+                                                               padx=4)
+        ttk.Label(btns, text="s").pack(side="left")
+        ttk.Button(btns, text="Apply",
+                   command=self._apply_poll).pack(side="left", padx=6)
         ttk.Label(adt, foreground="#555", wraplength=980, justify="left",
                   text=("Channels are read as the 286 has them configured. "
                         "The suite never changes the 286's channel setup or "
                         "units, because those are global and other runs "
                         "would be affected — set sensor types on the "
-                        "instrument before starting.")).grid(
-            row=2, column=0, columnspan=6, sticky="w", padx=8)
+                        "instrument before starting. You can keep using the "
+                        "286 by hand during a run: if changing its display "
+                        "cancels the channel scan, the suite notices within a "
+                        "few seconds and re-establishes it automatically.")
+                  ).grid(row=2, column=0, columnspan=6, sticky="w", padx=8)
         self.lst_channels = tk.Listbox(adt, height=7, width=52)
         self.lst_channels.grid(row=3, column=0, columnspan=3, sticky="w",
                                padx=8, pady=6)
@@ -618,6 +639,8 @@ class SuiteApp(tk.Tk):
                    command=self._stop_selected).pack(side="left", padx=8)
         ttk.Button(bar, text="STOP EVERYTHING",
                    command=self._stop_all).pack(side="right")
+        self.lbl_scan = ttk.Label(bar, text="", foreground="#444")
+        self.lbl_scan.pack(side="right", padx=12)
 
         cols = ("name", "source", "state", "phase", "setpoint", "progress",
                 "reference")
@@ -710,18 +733,41 @@ class SuiteApp(tk.Tk):
                         "command header. Queries end in '?'.")
                   ).pack(fill="x", padx=10, pady=(0, 4))
 
-        quick = ttk.LabelFrame(t, text="Quick tries")
+        quick = ttk.LabelFrame(t, text="This instrument's own commands")
         quick.pack(fill="x", padx=8, pady=4)
-        for label, cmd in (("Identity", "*IDN?"),
-                           ("Additel set point", "TEMPerature:TARGet?"),
-                           ("Additel temperature", "TEMPerature?"),
-                           ("Additel control", "TEMPerature:MODE?"),
-                           ("Fluke set point", "SOUR:SPO?"),
-                           ("Error queue", "SYSTem:ERRor?")):
-            ttk.Button(quick, text=label,
-                       command=lambda c=cmd: (self.var_term_cmd.set(c),
-                                              self._terminal_send())
-                       ).pack(side="left", padx=4, pady=4)
+        ttk.Button(quick, text="Read set point",
+                   command=lambda: self._term_profile_cmd("sp_read")
+                   ).pack(side="left", padx=4, pady=4)
+        ttk.Button(quick, text="Read temperature",
+                   command=lambda: self._term_profile_cmd("value")
+                   ).pack(side="left", padx=4, pady=4)
+        ttk.Button(quick, text="Read unit",
+                   command=lambda: self._term_profile_cmd("unit")
+                   ).pack(side="left", padx=4, pady=4)
+        ttk.Button(quick, text="Identity",
+                   command=lambda: (self.var_term_cmd.set("*IDN?"),
+                                    self._terminal_send())
+                   ).pack(side="left", padx=4, pady=4)
+        ttk.Button(quick, text="Error queue",
+                   command=lambda: (self.var_term_cmd.set("SYSTem:ERRor?"),
+                                    self._terminal_send())
+                   ).pack(side="left", padx=4, pady=4)
+
+        find = ttk.LabelFrame(t, text="Find a command that this instrument "
+                                      "accepts")
+        find.pack(fill="x", padx=8, pady=4)
+        ttk.Button(find, text="Find temperature command",
+                   command=lambda: self._term_sweep("value")
+                   ).pack(side="left", padx=4, pady=4)
+        ttk.Button(find, text="Find set-point command",
+                   command=lambda: self._term_sweep("sp_read")
+                   ).pack(side="left", padx=4, pady=4)
+        ttk.Button(find, text="Find unit command",
+                   command=lambda: self._term_sweep("unit")
+                   ).pack(side="left", padx=4, pady=4)
+        ttk.Label(find, foreground="#555",
+                  text="Tries every known form and keeps the one that answers."
+                  ).pack(side="left", padx=8)
 
         self.log_terminal = scrolledtext.ScrolledText(t, height=18,
                                                       wrap="word")
@@ -756,6 +802,61 @@ class SuiteApp(tk.Tk):
         widget.insert("end", f"[{tag}] {message}\n", tag)
         widget.see("end")
         widget.configure(state="disabled")
+
+    def _term_profile_cmd(self, key):
+        """Send whichever command this instrument actually uses."""
+        choice = self.var_term_target.get()
+        source = self.sources.get(choice)
+        if source is None:
+            if choice == "ADT286":
+                messagebox.showinfo(
+                    "Readings",
+                    "The 286's readings come from its channel scan, not a "
+                    "single command. Its live values are on the Runs tab; "
+                    "channels are listed on the Instruments tab.")
+            else:
+                messagebox.showerror("Terminal",
+                                     "Select a connected heat source first.")
+            return
+        cmd = (source.profile.get(key) or "").strip()
+        if not cmd:
+            labels = {"sp_read": "set point", "value": "temperature",
+                      "unit": "unit"}
+            messagebox.showinfo(
+                "Not known yet",
+                f"No {labels.get(key, key)} command is known for "
+                f"{source.name} yet.\n\nUse 'Find {labels.get(key, key)} "
+                "command' below and it will try every known form.")
+            return
+        self.var_term_cmd.set(cmd)
+        self._terminal_send()
+
+    def _term_sweep(self, kind):
+        source = self.sources.get(self.var_term_target.get())
+        if source is None or not source.is_open:
+            messagebox.showerror("Terminal",
+                                 "Select a connected heat source first.")
+            return
+
+        def work():
+            try:
+                result = source.sweep(kind, log=self._term_log)
+            except Exception as e:
+                self._term_log("FAIL", str(e))
+                return
+            if result["winner"]:
+                self._save_source_profile(source)
+                self.after(0, lambda: messagebox.showinfo(
+                    "Found it",
+                    f"{source.name} answers to:\n\n    "
+                    f"{result['winner']}\n\nSaved to its profile."))
+            else:
+                self.after(0, lambda: messagebox.showinfo(
+                    "Nothing worked",
+                    "None of the known forms were accepted. The log lists "
+                    "everything tried - type a command from Additel's "
+                    "programming-commands PDF into the box above to test it."))
+        threading.Thread(target=work, daemon=True).start()
 
     def _terminal_send(self):
         cmd = self.var_term_cmd.get().strip()
@@ -844,6 +945,33 @@ class SuiteApp(tk.Tk):
         self.lst_p_duts.delete(0, "end")
         for c in self.adt.channels:
             self.lst_p_duts.insert("end", c)
+
+    def _apply_poll(self):
+        """Change how often the 286 is scanned.
+
+        Slower polling leaves the instrument freer for hands-on use during a
+        run. It also sets the floor for the stability window, so the profile
+        check is re-run against the new rate.
+        """
+        try:
+            value = float(str(self.var_poll.get()).replace(",", "."))
+        except ValueError:
+            messagebox.showerror("Read interval", "Enter a number of seconds.")
+            return
+        value = max(0.2, value)
+        self.adt.poll_interval = value
+        self._log("INFO", f"The 286 will now be read every {value:g} s. "
+                          f"Stability windows should be at least "
+                          f"{3 * value:g} s.")
+        for eng in self.engines.values():
+            if eng.is_active:
+                window = float(eng.profile.get("stability_window") or 0)
+                if window and window < 3 * value:
+                    self._log("WARN",
+                              f"[{eng.profile.get('name')}] is running with a "
+                              f"{window:g}s stability window, which is now "
+                              f"too short for this read interval. Its points "
+                              "may time out.")
 
     def _disconnect_adt(self):
         if any(e.is_active for e in self.engines.values()):

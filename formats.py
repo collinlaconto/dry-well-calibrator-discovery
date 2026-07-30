@@ -154,9 +154,13 @@ SP_READ_CANDIDATES = (
 )
 
 VALUE_CANDIDATES = (
-    # Additel style: the bare quantity reads the live value
-    "TEMPerature?", "TEMP?", "TEMPerature:VALue?",
-    "MEASure:TEMPerature?",
+    # Additel style: the bare quantity, or an explicit value/measure node
+    "TEMPerature?", "TEMP?", "TEMPerature:VALue?", "TEMP:VAL?",
+    "TEMPerature:MEASure?", "MEASure:TEMPerature?",
+    "SOURce:TEMPerature?", "TEMPerature:CURRent?",
+    # Additel's controllers expose a comprehensive status query whose first
+    # field is the live value; the temperature analogue is worth trying.
+    "TEMPerature:CONTrol:INFO?",
     # Fluke / standard SCPI style
     "SOUR:SENS:DAT? TEMP", "SOUR:SENS:DATA?", "MEAS:TEMP?", "MEAS?",
     "SOUR:TEMP?",
@@ -221,6 +225,25 @@ def second_field(reply):
         return ""
     parts = [p.strip() for p in str(reply).split(",")]
     return parts[1] if len(parts) > 1 and parts[1] else ""
+
+
+def plausible_unit_token(token):
+    """True if a reply field really looks like a unit, not another number.
+
+    Some instruments answer a query with several numbers (value, target,
+    unit, ...). Without this check the second number would be stored as the
+    unit and then sent back on every write.
+    """
+    token = (token or "").strip()
+    if not token:
+        return False
+    if token in UNIT_ID_NAMES:
+        return True
+    try:
+        float(token)
+    except ValueError:
+        return len(token) <= 12          # an alphabetic unit name like "C"
+    return False                          # a bare number that is not a unit id
 
 
 def unit_token_for(unit_name):
