@@ -75,6 +75,10 @@ def default_profile(name="New profile"):
         "reference_channel": "",
         "dut_channels": [],
         "setpoints": [],
+        # tolerance: how far a device may sit from the reference and pass
+        "tolerance_mode": "single",   # 'single' across the range, or 'per_point'
+        "tolerance": 0.05,
+        "tolerances": [],             # one per set point when per_point
         # stability
         "stability_band": 0.02,     # peak-to-peak allowed, in display units
         "stability_window": 60.0,   # seconds the band must hold
@@ -94,6 +98,23 @@ def default_profile(name="New profile"):
 
 
 MIN_STABILITY_SAMPLES = 3
+
+
+def tolerance_at(profile, index):
+    """The tolerance that applies at set point `index`."""
+    if (profile.get("tolerance_mode") or "single") == "per_point":
+        values = profile.get("tolerances") or []
+        if index < len(values):
+            try:
+                value = float(values[index])
+                if value > 0:
+                    return value
+            except (TypeError, ValueError):
+                pass
+    try:
+        return float(profile.get("tolerance") or 0.05)
+    except (TypeError, ValueError):
+        return 0.05
 
 
 def validate_profile(profile, heat_source=None, available_channels=None,
@@ -131,6 +152,20 @@ def validate_profile(profile, heat_source=None, available_channels=None,
                 f"Set points out of range for {heat_source.name} "
                 f"({lo:g} to {hi:g} {heat_source.unit}): "
                 + ", ".join(f"{v:g}" for v in bad))
+    mode = profile.get("tolerance_mode") or "single"
+    if mode == "per_point":
+        values = profile.get("tolerances") or []
+        if len(values) != len(sps):
+            problems.append(
+                f"Per-point tolerances: {len(values)} given for "
+                f"{len(sps)} set point(s). Give one for each, or switch to a "
+                "single tolerance for the whole range.")
+        bad = [v for v in values if not _positive(v)]
+        if bad:
+            problems.append(
+                "Every tolerance must be a number greater than zero.")
+    elif not _positive(profile.get("tolerance")):
+        problems.append("Tolerance must be a number greater than zero.")
     if profile.get("sample_count", 0) < 1:
         problems.append("Sample count must be at least 1.")
     if profile.get("stability_band", 0) <= 0:
@@ -156,12 +191,20 @@ def validate_profile(profile, heat_source=None, available_channels=None,
     return problems
 
 
+def _positive(value):
+    try:
+        return float(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 class SetPointResult:
     """Everything measured at one set point."""
 
-    def __init__(self, setpoint, unit):
+    def __init__(self, setpoint, unit, tolerance=None):
         self.setpoint = setpoint
         self.unit = unit
+        self.tolerance = tolerance
         self.stable = False
         self.stabilize_seconds = 0.0
         self.note = ""
@@ -192,9 +235,22 @@ class SetPointResult:
             st = self._stats([s["duts"].get(ch) for s in self.samples])
             st["error"] = (None if st["mean"] is None or ref_mean is None
                            else st["mean"] - ref_mean)
+            st["tolerance"] = self.tolerance
+            st["in_tolerance"] = (
+                None if st["error"] is None or self.tolerance is None
+                else abs(st["error"]) <= self.tolerance)
             self.duts[ch] = st
         self.finished = time.time()
         return self
+
+    @property
+    def verdict(self):
+        """'pass', 'fail', or '' when tolerance was not set."""
+        checked = [d.get("in_tolerance") for d in self.duts.values()
+                   if d.get("in_tolerance") is not None]
+        if not checked:
+            return ""
+        return "pass" if all(checked) else "fail"
 
 
 class RunEngine:
@@ -241,6 +297,11 @@ class RunEngine:
                    setpoint=self.current_setpoint)
 
     # -------------------------------------------------------- lifecycle ----
+    @property
+    def tolerance(self):
+        """Tolerance for the point being measured right now."""
+        return tolerance_at(self.profile, max(self.current_index, 0))
+
     @property
     def channels(self):
         ref = self.profile.get("reference_channel")
@@ -413,7 +474,8 @@ class RunEngine:
                     break
                 self.current_index = idx
                 self.current_setpoint = sp
-                result = SetPointResult(sp, unit)
+                tolerance = tolerance_at(self.profile, idx)
+                result = SetPointResult(sp, unit, tolerance)
 
                 self._set_phase(PHASE_SETTING)
                 hs.set_setpoint(sp, send_password=self.profile.get(
@@ -456,6 +518,15 @@ class RunEngine:
                 if not self._take_samples(result):
                     break
                 result.summarise(self.profile["dut_channels"])
+                failed = [ch for ch, d in result.duts.items()
+                          if d.get("in_tolerance") is False]
+                if failed:
+                    self._log("FAIL", f"{sp:g} {unit}: out of tolerance on "
+                                      + ", ".join(failed)
+                                      + f" (±{result.tolerance:g})")
+                elif result.verdict == "pass":
+                    self._log("PASS", f"{sp:g} {unit}: all devices within "
+                                      f"±{result.tolerance:g}")
                 self.results.append(result)
                 self._emit("result", result=result, index=idx)
             else:

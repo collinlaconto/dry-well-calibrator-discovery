@@ -42,23 +42,30 @@ finishes you get a table, a graph, and two CSV files.
 
 ## Install and start
 
-Put all eight files in one folder and run the launcher:
+Put all ten files in one folder, install pyserial once, then
+**double-click `Calibration Suite.pyw`**.
 
 ```
 pip install pyserial
-python run_calibration_suite.py
 ```
 
 ```
 your-folder/
-    run_calibration_suite.py    <- start this one
-    ui.py          engine.py     adt286.py    heatsource.py
-    transport.py   formats.py    export.py
+    Calibration Suite.pyw       <- double-click this
+    run_calibration_suite.py    <- same app, from a command prompt
+    ui.py        theme.py       engine.py     adt286.py
+    heatsource.py               transport.py  formats.py    export.py
 ```
 
-The launcher works whether the seven modules sit flat beside it or inside a
-`calsuite/` subfolder, and if any are missing it names them instead of
-throwing an import error.
+The `.pyw` extension tells Windows to run it with `pythonw.exe`, so the window
+opens on its own with **no console behind it**. If you start the `.py` version
+instead, the console it creates is hidden automatically — but a prompt you
+already had open is left alone, so running it from a terminal still shows
+output.
+
+The launcher works whether the modules sit flat beside it or in a `calsuite/`
+subfolder. If a file is missing it says which in a dialog box, rather than
+failing silently behind a hidden console.
 
 Two files are created next to the launcher and grow as you work:
 
@@ -66,6 +73,32 @@ Two files are created next to the launcher and grow as you work:
 |---|---|
 | `heat_source_profiles.json` | each heat source: connection, range, command set, unit |
 | `calibration_profiles.json` | each calibration: channels, set points, stability and sampling settings |
+
+## The interface
+
+A dark instrument console with softly rounded panels. A sidebar holds the
+tools; the temperature calibrator is the first of them. Measured values are set in a fixed-width
+face with tabular figures so decimal points line up down a column, the way
+instrument front panels do. Colour carries meaning and nothing else: cyan for
+the reference, amber for a measured value or a wait, green for in tolerance,
+red for out of tolerance.
+
+The **Runs** page puts the calibration you are watching at the top, at a size
+readable from across the bench:
+
+- **Large readouts** — the live reference in cyan, the set point, and points
+  completed.
+- **A stabilisation curve** — the reference probe's recent history with the
+  stability band drawn around the running mean, so you can watch the trace
+  settle into it instead of guessing how long is left.
+- **A deviation band per device** — the tolerance envelope around zero with a
+  dot for the current error, and a PASS or FAIL beside it. Whether a probe is
+  failing is legible without reading a number.
+
+Underneath, every other run gets one compact strip with the same information
+in miniature. Click a strip to bring that run into focus. Below that, the
+selected run's channels are listed with reading age, so a stalled scan is
+obvious.
 
 ## Quick start
 
@@ -151,6 +184,7 @@ On the **Profiles** tab:
 
 | Setting | Meaning | Default |
 |---|---|---|
+| Tolerance | how far a device may sit from the reference and still pass | ±0.05 |
 | Heat source | which connected instrument drives the temperature | — |
 | Reference probe channel | the 286 channel your reference is on | — |
 | DUT channels | the channels being calibrated (multi-select) | — |
@@ -163,6 +197,19 @@ On the **Profiles** tab:
 | Seconds between samples | interval between them | 5 s |
 | Enable output at start / off at end | whether to drive the heater remotely | on / on |
 | If a point never stabilises | `record` (flag it) or `abort` | record |
+
+### Tolerance
+
+Choose **one tolerance for the whole range**, or **a tolerance for each set
+point** — useful when a specification tightens at ambient and loosens at the
+extremes. "Fill from the single value" turns one number into a per-point list
+you can then edit. Give one value per set point, in the same order; a
+mismatched count is caught before the run starts.
+
+Every recorded point carries the tolerance that applied to it, each device is
+marked PASS or FAIL against it, and the summary CSV states an overall verdict
+for the run. If no tolerance is set, results are left blank rather than
+quietly marked as passing.
 
 **Check this profile** validates everything before any hardware moves: channel
 assignments, duplicate or clashing channels, and whether every set point is
@@ -274,7 +321,8 @@ nameplate, since the software refuses set points outside the range you set.
 
 | Symptom | Cause and fix |
 |---|---|
-| "No module named calsuite" | A file is missing or misplaced. Put all eight files in one folder; the launcher names anything absent. |
+| "No module named calsuite" | A file is missing or misplaced. Put all ten files in one folder; the launcher names anything absent in a dialog. |
+| A console window sits behind the app | Start `Calibration Suite.pyw`. If one still appears, Windows may be opening `.pyw` files with `python.exe`: right-click the file, Open with, and choose `pythonw.exe`. The `.py` launcher also hides its own console and, failing that, restarts itself windowless. Set `CALSUITE_KEEP_CONSOLE=1` to keep the console for debugging. |
 | Readings stop mid-run | The 286's display was changed, cancelling the scan. It recovers automatically within a few seconds — watch the scan health indicator. |
 | Every set point times out, but the bath looks steady | The stability window is too short for the scan rate. Use at least three read intervals, or scan faster. |
 | No set-point command recognised | Run **Check / discover commands**. If it still fails, use the Terminal's **Find set-point command**, then type candidates by hand. |

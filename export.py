@@ -14,6 +14,16 @@ def safe_name(text):
     return re.sub(r"[^\w\-]+", "_", (text or "run")).strip("_") or "run"
 
 
+def _overall(engine):
+    """One word for the whole run, for the top of the certificate."""
+    verdicts = [r.verdict for r in engine.results if r.verdict]
+    if not verdicts:
+        return "not assessed (no tolerance set)"
+    if any(v == "fail" for v in verdicts):
+        return "FAIL - at least one device outside tolerance"
+    return "PASS - every device within tolerance"
+
+
 def _metadata_rows(engine, adt):
     p = engine.profile
     hs = engine.heat_source
@@ -37,6 +47,11 @@ def _metadata_rows(engine, adt):
         ["Reference channel", p.get("reference_channel", "")],
         ["DUT channels", ", ".join(p.get("dut_channels", []))],
         ["Set points", ", ".join(f"{s:g}" for s in p.get("setpoints", []))],
+        ["Tolerance",
+         (", ".join(f"±{v:g}" for v in p.get("tolerances", []))
+          if (p.get("tolerance_mode") == "per_point" and p.get("tolerances"))
+          else f"±{p.get('tolerance', 0.05)} across the range")],
+        ["Overall result", _overall(engine)],
         ["Stability band", f"{p.get('stability_band')} over "
                            f"{p.get('stability_window')} s"],
         ["Max wait per point", f"{p.get('max_wait')} s"],
@@ -60,7 +75,7 @@ def write_summary(engine, adt, path):
             "Set point", "Stable", "Stabilise (s)", "Note",
             f"Reference mean ({unit})", "Reference SD", "Reference n",
             "DUT channel", f"DUT mean ({unit})", "DUT SD", "DUT n",
-            f"Error DUT-Reference ({unit})",
+            f"Error DUT-Reference ({unit})", f"Tolerance ({unit})", "Result",
         ])
         for r in engine.results:
             ref = r.reference or {}
@@ -76,6 +91,9 @@ def write_summary(engine, adt, path):
                     ch,
                     _fmt(d.get("mean")), _fmt(d.get("sd"), 5), d.get("n", 0),
                     _fmt(d.get("error")),
+                    _fmt(d.get("tolerance")),
+                    "" if d.get("in_tolerance") is None
+                    else ("PASS" if d["in_tolerance"] else "FAIL"),
                 ])
     return path
 

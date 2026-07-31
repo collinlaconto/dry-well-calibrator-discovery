@@ -5,15 +5,16 @@ import os
 import queue
 import threading
 import time
+from collections import deque
 from datetime import datetime
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, scrolledtext
 
-from . import export
+from . import export, theme
 from .adt286 import Adt286
 from .engine import (ChannelRegistry, RunEngine, default_profile,
-                     validate_profile, STATE_RUNNING)
+                     tolerance_at, validate_profile, STATE_RUNNING)
 from .formats import KNOWN_MODELS, profile_for_model
 from .heatsource import HeatSource
 from .transport import (CANDIDATE_TCP_PORTS, DEFAULT_TCP_PORT,
@@ -73,7 +74,7 @@ class ConnectionPicker(ttk.Frame):
                                      textvariable=self.var_port, width=34,
                                      state="readonly")
         self.cbo_port.pack(side="left", padx=4)
-        ttk.Button(self.row_serial, text="Refresh",
+        theme.Button(self.row_serial, text="Refresh",
                    command=self.refresh_ports).pack(side="left", padx=4)
         ttk.Label(self.row_serial, text="Baud").pack(side="left", padx=(12, 2))
         ttk.Combobox(self.row_serial, textvariable=self.var_baud, width=8,
@@ -89,7 +90,7 @@ class ConnectionPicker(ttk.Frame):
         ttk.Label(self.row_tcp, text="Port").pack(side="left", padx=(12, 2))
         ttk.Entry(self.row_tcp, textvariable=self.var_tcp,
                   width=8).pack(side="left")
-        ttk.Button(self.row_tcp, text="Find port",
+        theme.Button(self.row_tcp, text="Find port",
                    command=self.find_port).pack(side="left", padx=8)
         self.lbl_hint = ttk.Label(self, text="", foreground="#555",
                                   wraplength=620, justify="left")
@@ -307,8 +308,9 @@ class SuiteApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1180x820")
-        self.minsize(1000, 700)
+        self.geometry("1240x840")
+        self.minsize(1040, 720)
+        self.fonts = theme.apply(self)
 
         self.adt = Adt286(logger=self._instrument_log)
         self.adt.on_recovery = lambda msg: self._log("WARN", msg)
@@ -409,39 +411,72 @@ class SuiteApp(tk.Tk):
 
     # ----------------------------------------------------------------- UI --
     def _build_ui(self):
-        self.nb = ttk.Notebook(self)
-        self.nb.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+        self.nb = theme.PageStack(
+            self, title="Calibration Suite",
+            groups={0: "Set up", 1: "Calibrate", 3: "Records", 5: "Tools"})
+        self.nb.pack(fill="both", expand=True)
         self._build_instruments_tab()
         self._build_profiles_tab()
         self._build_runs_tab()
         self._build_results_tab()
         self._build_terminal_tab()
+        self._build_activity_tab()
 
-        bar = ttk.LabelFrame(self, text="Activity")
-        bar.pack(fill="both", padx=8, pady=(0, 8))
-        self.log_main = scrolledtext.ScrolledText(bar, height=7, wrap="word")
-        self.log_main.pack(fill="both", expand=True, padx=6, pady=6)
-        for tag, colour in (("TX", "#0b5cad"), ("RX", "#20603d"),
-                            ("PASS", "#1a7f37"), ("FAIL", "#b00020"),
-                            ("WARN", "#9a6700"), ("INFO", "#444")):
+
+    def _build_activity_tab(self):
+        t = ttk.Frame(self.nb)
+        self.nb.add(t, text="Activity")
+        head = ttk.Frame(t)
+        head.pack(fill="x", padx=18, pady=(18, 8))
+        ttk.Label(head, text="Activity", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(head, style="Dim.TLabel",
+                  text="Every command sent and every reply received. Paste "
+                       "this in when something looks wrong."
+                  ).pack(anchor="w", pady=(2, 0))
+        card = theme.Card(t)
+        card.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+        self.log_main = scrolledtext.ScrolledText(
+            card, height=20, wrap="word", relief="flat", borderwidth=0,
+            background="#111619", foreground="#d6dee0", insertbackground="#d6dee0",
+            font=theme.FONTS.get("mono_small", ("Courier", 9)))
+        self.log_main.pack(fill="both", expand=True)
+        for tag, colour in (("TX", "#7fb3e8"), ("RX", "#8fd6ac"),
+                            ("PASS", "#8fd6ac"), ("FAIL", "#f0908a"),
+                            ("WARN", "#e8bd7a"), ("INFO", "#8e9a9e")):
             self.log_main.tag_config(tag, foreground=colour)
         self.log_main.configure(state="disabled")
+        theme.Button(t, text="Copy everything",
+                   command=self._copy_log).pack(anchor="e", padx=18,
+                                                pady=(0, 16))
+
+    def _copy_log(self):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self.log_main.get("1.0", "end").strip())
+            self._log("INFO", "Activity log copied to the clipboard.")
+        except Exception:
+            pass
 
     # --- tab 1 -------------------------------------------------------------
     def _build_instruments_tab(self):
         t = ttk.Frame(self.nb)
         self.nb.add(t, text=" 1 · Instruments ")
+        _h = ttk.Frame(t)
+        _h.pack(fill="x", padx=18, pady=(18, 10))
+        ttk.Label(_h, text="Instruments", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(_h, text="Connect the readout and every heat source, then prove their commands.", style="Dim.TLabel").pack(anchor="w",
+                                                             pady=(2, 0))
         pad = {"padx": 6, "pady": 4}
 
         adt = ttk.LabelFrame(t, text="Additel ADT286 (USB)")
-        adt.pack(fill="x", padx=8, pady=8)
+        adt.pack(fill="x", padx=18, pady=(0, 10))
         self.pick_adt = ConnectionPicker(adt, on_log=self._instrument_log)
         self.pick_adt.grid(row=0, column=0, columnspan=6, sticky="w", **pad)
         btns = ttk.Frame(adt)
         btns.grid(row=1, column=0, columnspan=6, sticky="w", padx=6)
-        ttk.Button(btns, text="Connect",
+        theme.Button(btns, text="Connect",
                    command=self._connect_adt).pack(side="left", padx=4)
-        ttk.Button(btns, text="Disconnect",
+        theme.Button(btns, text="Disconnect",
                    command=self._disconnect_adt).pack(side="left", padx=4)
         self.lbl_adt = ttk.Label(btns, text="Not connected",
                                  foreground="#b00020")
@@ -453,7 +488,7 @@ class SuiteApp(tk.Tk):
                      values=["0.5", "1", "2", "5", "10"]).pack(side="left",
                                                                padx=4)
         ttk.Label(btns, text="s").pack(side="left")
-        ttk.Button(btns, text="Apply",
+        theme.Button(btns, text="Apply",
                    command=self._apply_poll).pack(side="left", padx=6)
         ttk.Label(adt, foreground="#555", wraplength=980, justify="left",
                   text=("Channels are read as the 286 has them configured. "
@@ -475,7 +510,7 @@ class SuiteApp(tk.Tk):
 
         hs = ttk.LabelFrame(t, text="Heat sources (each on its own "
                                     "connection)")
-        hs.pack(fill="both", expand=True, padx=8, pady=8)
+        hs.pack(fill="both", expand=True, padx=18, pady=(0, 16))
         row = ttk.Frame(hs)
         row.pack(fill="x", padx=6, pady=6)
         ttk.Label(row, text="Add").pack(side="left")
@@ -483,11 +518,11 @@ class SuiteApp(tk.Tk):
         self.cbo_new_source = ttk.Combobox(row, textvariable=self.var_new_source,
                                            width=46, state="readonly")
         self.cbo_new_source.pack(side="left", padx=6)
-        ttk.Button(row, text="Connect heat source",
+        theme.Button(row, text="Connect heat source",
                    command=self._connect_source).pack(side="left", padx=6)
-        ttk.Button(row, text="Disconnect selected",
+        theme.Button(row, text="Disconnect selected",
                    command=self._disconnect_source).pack(side="left")
-        ttk.Button(row, text="Check / discover commands",
+        theme.Button(row, text="Check / discover commands",
                    command=self._verify_source).pack(side="left", padx=8)
         self.pick_source = ConnectionPicker(hs, on_log=self._instrument_log)
         self.pick_source.pack(fill="x", padx=6, pady=(0, 6))
@@ -506,10 +541,15 @@ class SuiteApp(tk.Tk):
     def _build_profiles_tab(self):
         t = ttk.Frame(self.nb)
         self.nb.add(t, text=" 2 · Profiles ")
+        _h = ttk.Frame(t)
+        _h.pack(fill="x", padx=18, pady=(18, 10))
+        ttk.Label(_h, text="Calibration profiles", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(_h, text="What to calibrate, at which set points, and how steady it must be.", style="Dim.TLabel").pack(anchor="w",
+                                                             pady=(2, 0))
         pad = {"padx": 6, "pady": 3}
 
         left = ttk.LabelFrame(t, text="Calibration profiles")
-        left.pack(side="left", fill="y", padx=8, pady=8)
+        left.pack(side="left", fill="y", padx=(18, 0), pady=(0, 16))
         self.lst_profiles = tk.Listbox(left, width=30, height=24,
                                        exportselection=False)
         self.lst_profiles.pack(fill="y", expand=True, padx=6, pady=6)
@@ -518,11 +558,11 @@ class SuiteApp(tk.Tk):
                          ("Save", self._save_profile),
                          ("Duplicate", self._duplicate_profile),
                          ("Delete", self._delete_profile)):
-            ttk.Button(left, text=txt, command=cmd).pack(fill="x", padx=6,
+            theme.Button(left, text=txt, command=cmd).pack(fill="x", padx=6,
                                                          pady=2)
 
         form = ttk.Frame(t)
-        form.pack(side="left", fill="both", expand=True, padx=8, pady=8)
+        form.pack(side="left", fill="both", expand=True, padx=18, pady=(0, 16))
 
         basic = ttk.LabelFrame(form, text="What to calibrate")
         basic.pack(fill="x", pady=4)
@@ -564,6 +604,31 @@ class SuiteApp(tk.Tk):
                   text="They run in the order given — e.g. 0, 50, 100, 50, 0 "
                        "for an up-and-down sequence.").grid(
             row=1, column=1, sticky="w", padx=6)
+
+        tol = ttk.LabelFrame(form, text="Tolerance — how far a device may sit "
+                                       "from the reference and still pass")
+        tol.pack(fill="x", pady=4)
+        self.var_tol_mode = tk.StringVar(value="single")
+        self.var_tol = tk.StringVar(value="0.05")
+        self.var_tol_list = tk.StringVar(value="")
+        ttk.Radiobutton(tol, text="One tolerance for the whole range",
+                        variable=self.var_tol_mode, value="single",
+                        command=self._sync_tolerance_mode).grid(
+            row=0, column=0, sticky="w", **pad)
+        self.ent_tol = ttk.Entry(tol, textvariable=self.var_tol, width=10)
+        self.ent_tol.grid(row=0, column=1, sticky="w", **pad)
+        ttk.Radiobutton(tol, text="A tolerance for each set point",
+                        variable=self.var_tol_mode, value="per_point",
+                        command=self._sync_tolerance_mode).grid(
+            row=1, column=0, sticky="w", **pad)
+        self.ent_tol_list = ttk.Entry(tol, textvariable=self.var_tol_list,
+                                      width=42)
+        self.ent_tol_list.grid(row=1, column=1, columnspan=2, sticky="w", **pad)
+        self.lbl_tol_hint = ttk.Label(tol, style="Dim.TLabel", text="")
+        self.lbl_tol_hint.grid(row=2, column=0, columnspan=3, sticky="w",
+                               padx=6, pady=(0, 6))
+        theme.Button(tol, text="Fill from the single value",
+                   command=self._fill_tolerances).grid(row=1, column=3, **pad)
 
         stab = ttk.LabelFrame(form, text="Stability and sampling")
         stab.pack(fill="x", pady=4)
@@ -618,73 +683,96 @@ class SuiteApp(tk.Tk):
 
         act = ttk.Frame(form)
         act.pack(fill="x", pady=6)
-        ttk.Button(act, text="Check this profile",
+        theme.Button(act, text="Check this profile",
                    command=self._validate_profile).pack(side="left")
-        ttk.Button(act, text="Save and start run",
+        theme.Button(act, text="Save and start run",
                    command=self._save_and_start).pack(side="left", padx=8)
 
     # --- tab 3 -------------------------------------------------------------
     def _build_runs_tab(self):
         t = ttk.Frame(self.nb)
         self.nb.add(t, text=" 3 · Runs ")
+
+        head = ttk.Frame(t)
+        head.pack(fill="x", padx=18, pady=(18, 10))
+        titles = ttk.Frame(head)
+        titles.pack(side="left")
+        ttk.Label(titles, text="Runs", style="Title.TLabel").pack(anchor="w")
+        self.lbl_runcount = ttk.Label(titles, text="Nothing running",
+                                      style="Dim.TLabel")
+        self.lbl_runcount.pack(anchor="w", pady=(2, 0))
+        self.lbl_scan = ttk.Label(head, text="", style="Dim.TLabel")
+        self.lbl_scan.pack(side="right", pady=(6, 0))
+
         bar = ttk.Frame(t)
-        bar.pack(fill="x", padx=8, pady=8)
-        ttk.Label(bar, text="Start").pack(side="left")
+        bar.pack(fill="x", padx=18, pady=(0, 12))
         self.var_run_choice = tk.StringVar()
         self.cbo_run_choice = ttk.Combobox(bar, textvariable=self.var_run_choice,
-                                           width=34, state="readonly")
-        self.cbo_run_choice.pack(side="left", padx=6)
-        ttk.Button(bar, text="Start run",
-                   command=self._start_selected).pack(side="left")
-        ttk.Button(bar, text="Stop selected run",
-                   command=self._stop_selected).pack(side="left", padx=8)
-        ttk.Button(bar, text="STOP EVERYTHING",
+                                           width=32, state="readonly")
+        self.cbo_run_choice.pack(side="left")
+        theme.Button(bar, text="Start run", style="Primary.TButton",
+                   command=self._start_selected).pack(side="left", padx=8)
+        theme.Button(bar, text="Stop selected",
+                   command=self._stop_selected).pack(side="left")
+        theme.Button(bar, text="Stop everything", style="Danger.TButton",
                    command=self._stop_all).pack(side="right")
-        self.lbl_scan = ttk.Label(bar, text="", foreground="#444")
-        self.lbl_scan.pack(side="right", padx=12)
 
-        cols = ("name", "source", "state", "phase", "setpoint", "progress",
-                "reference", "duts")
-        self.tbl_runs = ttk.Treeview(t, columns=cols, show="headings",
-                                     height=8)
-        for c, w, txt in (("name", 160, "Run"), ("source", 140, "Heat source"),
-                          ("state", 80, "State"), ("phase", 140, "Phase"),
-                          ("setpoint", 80, "Set point"),
-                          ("progress", 90, "Points done"),
-                          ("reference", 110, "Reference now"),
-                          ("duts", 260, "Devices under test")):
-            self.tbl_runs.heading(c, text=txt)
-            self.tbl_runs.column(c, width=w, anchor="w")
-        self.tbl_runs.pack(fill="both", expand=True, padx=8, pady=6)
-        self.tbl_runs.bind("<<TreeviewSelect>>",
-                           lambda e: self._refresh_live_panel())
+        # the run you are watching, at a size readable across the bench
+        self.monitor = theme.MonitorCard(t)
+        self.monitor.pack(fill="x", padx=18, pady=(0, 12))
+        self.history = {}          # run_id -> deque of (t, reference)
+        self._monitor_channels = None
 
-        live = ttk.LabelFrame(t, text="Live channel readings")
-        live.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+        # every other run, one compact strip each
+        self.rack = ttk.Frame(t)
+        self.rack.pack(fill="x", padx=18)
+        self.strips = {}
+        self.selected_run = None
+        self.lbl_empty = ttk.Label(
+            t, style="Dim.TLabel",
+            text="No calibrations running. Choose a profile above and start "
+                 "one — you can run several at once, one per heat source.")
+        self.lbl_empty.pack(anchor="w", padx=18, pady=8)
+
+        live = ttk.Frame(t)
+        live.pack(fill="both", expand=True, padx=18, pady=(14, 8))
+        lh = ttk.Frame(live)
+        lh.pack(fill="x")
+        ttk.Label(lh, text="CHANNEL DETAIL", style="Dim.TLabel").pack(side="left")
+        self.lbl_live_note = ttk.Label(lh, text="", style="Dim.TLabel")
+        self.lbl_live_note.pack(side="right")
         lcols = ("channel", "role", "reading", "error", "age")
         self.tbl_live = ttk.Treeview(live, columns=lcols, show="headings",
-                                     height=7)
-        for c, w, txt in (("channel", 150, "Channel"), ("role", 130, "Role"),
-                          ("reading", 130, "Reading"),
-                          ("error", 150, "Error vs reference"),
-                          ("age", 110, "Reading age")):
+                                     height=6)
+        for c, w, txt in (("channel", 150, "Channel"), ("role", 150, "Role"),
+                          ("reading", 140, "Reading"),
+                          ("error", 160, "Error vs reference"),
+                          ("age", 120, "Reading age")):
             self.tbl_live.heading(c, text=txt)
             self.tbl_live.column(c, width=w, anchor="w")
-        self.tbl_live.pack(fill="both", expand=True, padx=6, pady=6)
-        self.lbl_live_note = ttk.Label(live, text="", foreground="#555")
-        self.lbl_live_note.pack(fill="x", padx=8, pady=(0, 6))
-        ttk.Label(t, foreground="#555", wraplength=1000, justify="left",
-                  text=("Runs share the one 286: their channels are scanned "
-                        "together and the readings fanned out. Starting or "
-                        "finishing a run reconfigures that shared scan, which "
-                        "pauses data for a second — harmless, but it is why "
-                        "a run's channels are locked to it while it is "
-                        "active.")).pack(fill="x", padx=10, pady=(0, 8))
+        self.tbl_live.pack(fill="both", expand=True, pady=(6, 0))
+
+        ttk.Label(t, style="Dim.TLabel", wraplength=940, justify="left",
+                  text=("All runs share the one 286: their channels are "
+                        "scanned together and the readings fanned out, so a "
+                        "channel belongs to one run while it is active.")
+                  ).pack(fill="x", padx=18, pady=(0, 14))
+
+    def _select_run(self, run_id):
+        self.selected_run = run_id
+        for rid, strip in self.strips.items():
+            strip.set_selected(rid == run_id)
+        self._refresh_live_panel()
 
     # --- tab 4 -------------------------------------------------------------
     def _build_results_tab(self):
         t = ttk.Frame(self.nb)
         self.nb.add(t, text=" 4 · Results ")
+        _h = ttk.Frame(t)
+        _h.pack(fill="x", padx=18, pady=(18, 10))
+        ttk.Label(_h, text="Results", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(_h, text="Every point measured, with the error against the reference.", style="Dim.TLabel").pack(anchor="w",
+                                                             pady=(2, 0))
         bar = ttk.Frame(t)
         bar.pack(fill="x", padx=8, pady=8)
         ttk.Label(bar, text="Run").pack(side="left")
@@ -694,13 +782,13 @@ class SuiteApp(tk.Tk):
         self.cbo_result_run.pack(side="left", padx=6)
         self.cbo_result_run.bind("<<ComboboxSelected>>",
                                  lambda e: self._show_results())
-        ttk.Button(bar, text="Refresh",
+        theme.Button(bar, text="Refresh",
                    command=self._show_results).pack(side="left")
-        ttk.Button(bar, text="Export CSV",
+        theme.Button(bar, text="Export CSV",
                    command=self._export_csv).pack(side="left", padx=8)
 
         cols = ("setpoint", "stable", "ref", "refsd", "channel", "mean", "sd",
-                "error", "n")
+                "error", "tol", "verdict", "n")
         self.tbl_results = ttk.Treeview(t, columns=cols, show="headings",
                                         height=10)
         for c, w, txt in (("setpoint", 90, "Set point"),
@@ -708,10 +796,13 @@ class SuiteApp(tk.Tk):
                           ("ref", 120, "Reference"), ("refsd", 90, "Ref SD"),
                           ("channel", 110, "DUT channel"),
                           ("mean", 120, "DUT mean"), ("sd", 90, "DUT SD"),
-                          ("error", 110, "Error"), ("n", 50, "n")):
+                          ("error", 110, "Error"),
+                          ("tol", 90, "Tolerance"), ("verdict", 70, "Result"),
+                          ("n", 50, "n")):
             self.tbl_results.heading(c, text=txt)
             self.tbl_results.column(c, width=w, anchor="w")
         self.tbl_results.pack(fill="both", expand=True, padx=8, pady=6)
+        self.tbl_results.tag_configure("fail", foreground=theme.RED)
         self.plot = PlotCanvas(t, height=300)
         self.plot.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
@@ -719,6 +810,11 @@ class SuiteApp(tk.Tk):
     def _build_terminal_tab(self):
         t = ttk.Frame(self.nb)
         self.nb.add(t, text=" 5 · Terminal ")
+        _h = ttk.Frame(t)
+        _h.pack(fill="x", padx=18, pady=(18, 10))
+        ttk.Label(_h, text="Terminal", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(_h, text="Talk to an instrument directly, and find commands it accepts.", style="Dim.TLabel").pack(anchor="w",
+                                                             pady=(2, 0))
         bar = ttk.Frame(t)
         bar.pack(fill="x", padx=8, pady=8)
         ttk.Label(bar, text="Instrument").pack(side="left")
@@ -727,7 +823,7 @@ class SuiteApp(tk.Tk):
                                             textvariable=self.var_term_target,
                                             width=32, state="readonly")
         self.cbo_term_target.pack(side="left", padx=6)
-        ttk.Button(bar, text="Refresh list",
+        theme.Button(bar, text="Refresh list",
                    command=self._refresh_terminal_targets).pack(side="left")
         self.var_term_err = tk.BooleanVar(value=True)
         ttk.Checkbutton(bar, text="Check SYSTem:ERRor? after every command",
@@ -740,7 +836,7 @@ class SuiteApp(tk.Tk):
         ent = ttk.Entry(row, textvariable=self.var_term_cmd)
         ent.pack(side="left", fill="x", expand=True, padx=6)
         ent.bind("<Return>", lambda e: self._terminal_send())
-        ttk.Button(row, text="Send",
+        theme.Button(row, text="Send",
                    command=self._terminal_send).pack(side="left")
 
         ttk.Label(t, foreground="#555", wraplength=1000, justify="left",
@@ -754,20 +850,20 @@ class SuiteApp(tk.Tk):
 
         quick = ttk.LabelFrame(t, text="This instrument's own commands")
         quick.pack(fill="x", padx=8, pady=4)
-        ttk.Button(quick, text="Read set point",
+        theme.Button(quick, text="Read set point",
                    command=lambda: self._term_profile_cmd("sp_read")
                    ).pack(side="left", padx=4, pady=4)
-        ttk.Button(quick, text="Read temperature",
+        theme.Button(quick, text="Read temperature",
                    command=lambda: self._term_profile_cmd("value")
                    ).pack(side="left", padx=4, pady=4)
-        ttk.Button(quick, text="Read unit",
+        theme.Button(quick, text="Read unit",
                    command=lambda: self._term_profile_cmd("unit")
                    ).pack(side="left", padx=4, pady=4)
-        ttk.Button(quick, text="Identity",
+        theme.Button(quick, text="Identity",
                    command=lambda: (self.var_term_cmd.set("*IDN?"),
                                     self._terminal_send())
                    ).pack(side="left", padx=4, pady=4)
-        ttk.Button(quick, text="Error queue",
+        theme.Button(quick, text="Error queue",
                    command=lambda: (self.var_term_cmd.set("SYSTem:ERRor?"),
                                     self._terminal_send())
                    ).pack(side="left", padx=4, pady=4)
@@ -775,13 +871,13 @@ class SuiteApp(tk.Tk):
         find = ttk.LabelFrame(t, text="Find a command that this instrument "
                                       "accepts")
         find.pack(fill="x", padx=8, pady=4)
-        ttk.Button(find, text="Find temperature command",
+        theme.Button(find, text="Find temperature command",
                    command=lambda: self._term_sweep("value")
                    ).pack(side="left", padx=4, pady=4)
-        ttk.Button(find, text="Find set-point command",
+        theme.Button(find, text="Find set-point command",
                    command=lambda: self._term_sweep("sp_read")
                    ).pack(side="left", padx=4, pady=4)
-        ttk.Button(find, text="Find unit command",
+        theme.Button(find, text="Find unit command",
                    command=lambda: self._term_sweep("unit")
                    ).pack(side="left", padx=4, pady=4)
         ttk.Label(find, foreground="#555",
@@ -1212,6 +1308,12 @@ class SuiteApp(tk.Tk):
                 p[key] = cast(str(var.get()).strip().replace(",", "."))
             except ValueError:
                 pass
+        p["tolerance_mode"] = self.var_tol_mode.get()
+        try:
+            p["tolerance"] = float(str(self.var_tol.get()).replace(",", "."))
+        except ValueError:
+            pass
+        p["tolerances"] = self._parse_setpoints(self.var_tol_list.get())
         p["require_near_setpoint"] = bool(self.var_p_near.get())
         p["enable_output"] = bool(self.var_p_enable.get())
         p["disable_at_end"] = bool(self.var_p_disable.get())
@@ -1245,6 +1347,11 @@ class SuiteApp(tk.Tk):
         self.var_p_interval.set(str(p.get("sample_interval", 5)))
         self.var_p_soak.set(str(p.get("soak_seconds", 0)))
         self.var_p_sptol.set(str(p.get("setpoint_tolerance", 1.0)))
+        self.var_tol_mode.set(p.get("tolerance_mode", "single"))
+        self.var_tol.set(str(p.get("tolerance", 0.05)))
+        self.var_tol_list.set(", ".join(f"{v:g}"
+                                        for v in p.get("tolerances", [])))
+        self._sync_tolerance_mode()
         self.var_p_near.set(bool(p.get("require_near_setpoint")))
         self.var_p_enable.set(bool(p.get("enable_output", True)))
         self.var_p_disable.set(bool(p.get("disable_at_end", True)))
@@ -1255,6 +1362,28 @@ class SuiteApp(tk.Tk):
         for i in range(self.lst_p_duts.size()):
             if self.lst_p_duts.get(i) in wanted:
                 self.lst_p_duts.selection_set(i)
+
+    def _sync_tolerance_mode(self, *_a):
+        per_point = self.var_tol_mode.get() == "per_point"
+        self.ent_tol.configure(state="disabled" if per_point else "normal")
+        self.ent_tol_list.configure(state="normal" if per_point else "disabled")
+        points = self._parse_setpoints(self.var_p_setpoints.get())
+        if per_point:
+            given = self._parse_setpoints(self.var_tol_list.get())
+            self.lbl_tol_hint.configure(
+                text=f"One value per set point, in the same order — "
+                     f"{len(given)} given for {len(points)} set point(s).")
+        else:
+            self.lbl_tol_hint.configure(
+                text="Applies at every set point. Devices outside it are "
+                     "recorded and marked FAIL.")
+
+    def _fill_tolerances(self):
+        points = self._parse_setpoints(self.var_p_setpoints.get())
+        value = (self.var_tol.get() or "0.05").strip()
+        self.var_tol_list.set(", ".join([value] * len(points)))
+        self.var_tol_mode.set("per_point")
+        self._sync_tolerance_mode()
 
     def _select_profile(self, _e=None):
         sel = self.lst_profiles.curselection()
@@ -1371,8 +1500,10 @@ class SuiteApp(tk.Tk):
         self._refresh_results_choices()
 
     def _selected_run_id(self):
-        sel = self.tbl_runs.selection()
-        return sel[0] if sel else None
+        if self.selected_run in self.engines:
+            return self.selected_run
+        active = [rid for rid, e in self.engines.items() if e.is_active]
+        return active[0] if len(active) == 1 else None
 
     def _stop_selected(self):
         run_id = self._selected_run_id()
@@ -1446,27 +1577,154 @@ class SuiteApp(tk.Tk):
                      f"{getattr(self.adt, 'poll_interval', 1):g} s.")
 
     def _refresh_run_table(self):
-        existing = set(self.tbl_runs.get_children())
+        """Keep one rack strip per run, in sync with the engines."""
+        phase_kind = {
+            "waiting for stability": "wait", "setting set point": "wait",
+            "soaking": "wait", "sampling": "run", "finished": "done",
+            "idle": "idle",
+        }
         for run_id, eng in self.engines.items():
+            strip = self.strips.get(run_id)
+            if strip is None:
+                strip = theme.RunStrip(self.rack, on_select=self._select_run,
+                                       run_id=run_id)
+                strip.pack(fill="x", pady=(0, 10))
+                strip.set_channels(eng.profile.get("dut_channels", []),
+                                   self._tolerance_for(eng))
+                self.strips[run_id] = strip
+                if self.selected_run is None:
+                    self._select_run(run_id)
+
+            kind = phase_kind.get(eng.phase, "run")
+            if eng.state in ("aborted", "error"):
+                kind = "bad"
+            elif eng.state == "complete":
+                kind = "done"
+            phase = eng.phase if eng.is_active else eng.state
+            strip.update_head(eng.profile.get("name", ""),
+                              f"{eng.heat_source.name} · ref "
+                              f"{eng.profile.get('reference_channel', '')}",
+                              phase, kind)
+
+            unit = getattr(self.adt, "unit", "") or "°C"
             ref_value, _age = self._live(eng.profile.get("reference_channel"))
             if ref_value is None:
                 ref_value = eng.last_reference
-            ref = "" if ref_value is None else f"{ref_value:.3f}"
-            duts = []
-            for ch in eng.profile.get("dut_channels", []):
-                value, _ = self._live(ch)
-                duts.append(f"{ch} —" if value is None
-                            else f"{ch} {value:.3f}")
-            values = (eng.profile.get("name", ""), eng.heat_source.name,
-                      eng.state, eng.phase,
-                      "" if eng.current_setpoint is None
-                      else f"{eng.current_setpoint:g}",
-                      f"{len(eng.results)}/{len(eng.profile.get('setpoints', []))}",
-                      ref, "   ".join(duts))
-            if run_id in existing:
-                self.tbl_runs.item(run_id, values=values)
-            else:
-                self.tbl_runs.insert("", "end", iid=run_id, values=values)
+            points = eng.profile.get("setpoints", []) or [1]
+            done = len(eng.results)
+            strip.update_values(
+                "—" if ref_value is None else f"{ref_value:.4f}",
+                "—" if eng.current_setpoint is None
+                else f"{eng.current_setpoint:g} {unit}",
+                self._flat_text(eng),
+                done / max(len(points), 1),
+                f"{done} of {len(points)} points"
+                + (f" · next {points[done]:g} {unit}"
+                   if done < len(points) and eng.is_active else ""))
+
+            tol = self._tolerance_for(eng)
+            for channel in eng.profile.get("dut_channels", []):
+                value, _ = self._live(channel)
+                error = (None if value is None or ref_value is None
+                         else value - ref_value)
+                strip.update_channel(channel, error, tol)
+
+        for run_id in list(self.strips):
+            if run_id not in self.engines:
+                self.strips.pop(run_id).destroy()
+
+        self._refresh_monitor()
+
+        active = sum(1 for e in self.engines.values() if e.is_active)
+        self.lbl_runcount.configure(
+            text="Nothing running" if not active
+            else f"{active} running" + (f" · {len(self.engines) - active} finished"
+                                        if len(self.engines) > active else ""))
+        if self.strips:
+            self.lbl_empty.pack_forget()
+        else:
+            self.lbl_empty.pack(anchor="w", padx=18, pady=8)
+
+    def _refresh_monitor(self):
+        """The focused run, shown large with its stabilisation curve."""
+        run_id = self._selected_run_id()
+        engine = self.engines.get(run_id)
+        if engine is None:
+            self.monitor.update_head("Nothing running", "", "idle", "idle")
+            self.monitor.update_values("—", "—", "—")
+            self.monitor.curve.show([])
+            if self._monitor_channels is not None:
+                self.monitor.set_channels([], 0.05)
+                self._monitor_channels = None
+            return
+
+        unit = getattr(self.adt, "unit", "") or "°C"
+        tol = self._tolerance_for(engine)
+        signature = (run_id, tuple(engine.profile.get("dut_channels", [])), tol)
+        if signature != self._monitor_channels:
+            self.monitor.set_channels(engine.profile.get("dut_channels", []),
+                                      tol)
+            self._monitor_channels = signature
+
+        kind = {"waiting for stability": "wait", "setting set point": "wait",
+                "soaking": "wait", "sampling": "run",
+                "finished": "done"}.get(engine.phase, "run")
+        if engine.state in ("aborted", "error"):
+            kind = "bad"
+        elif engine.state == "complete":
+            kind = "done"
+        self.monitor.update_head(
+            engine.profile.get("name", ""),
+            f"{engine.heat_source.name} · reference "
+            f"{engine.profile.get('reference_channel', '')} · tolerance "
+            f"±{tol:g} {unit}",
+            engine.phase if engine.is_active else engine.state, kind)
+
+        ref_value, _age = self._live(engine.profile.get("reference_channel"))
+        if ref_value is None:
+            ref_value = engine.last_reference
+        points = engine.profile.get("setpoints", [])
+        self.monitor.update_values(
+            "—" if ref_value is None else f"{ref_value:.4f} {unit}",
+            "—" if engine.current_setpoint is None
+            else f"{engine.current_setpoint:g} {unit}",
+            f"{len(engine.results)} of {len(points)} points")
+
+        # keep a rolling history for the curve
+        if ref_value is not None:
+            hist = self.history.setdefault(run_id, deque(maxlen=600))
+            now = time.time()
+            if not hist or now - hist[-1][0] >= 0.2:
+                hist.append((now, ref_value))
+            window = float(engine.profile.get("stability_window") or 60)
+            cutoff = now - max(window * 2.5, 30)
+            while len(hist) > 2 and hist[0][0] < cutoff:
+                hist.popleft()
+            self.monitor.curve.show(
+                list(hist),
+                band=float(engine.profile.get("stability_band") or 0.02),
+                setpoint=engine.current_setpoint,
+                window=window)
+
+        for channel in engine.profile.get("dut_channels", []):
+            value, _ = self._live(channel)
+            error = (None if value is None or ref_value is None
+                     else value - ref_value)
+            self.monitor.update_channel(channel, error, tol)
+
+    @staticmethod
+    def _tolerance_for(engine):
+        """The pass/fail tolerance at the point being measured."""
+        return tolerance_at(engine.profile, max(engine.current_index, 0))
+
+    @staticmethod
+    def _flat_text(engine):
+        if not engine.is_active:
+            return "—"
+        if engine.phase == "sampling":
+            return "stable"
+        window = engine.profile.get("stability_window")
+        return f"0 of {window:g} s" if window else "—"
 
     # -------------------------------------------------------------- results --
     def _refresh_results_choices(self):
@@ -1500,13 +1758,20 @@ class SuiteApp(tk.Tk):
             ref = r.reference or {}
             for ch in duts:
                 d = r.duts.get(ch, {})
+                verdict = d.get("in_tolerance")
                 self.tbl_results.insert(
                     "", "end",
+                    tags=("fail",) if verdict is False else (),
                     values=(f"{r.setpoint:g}",
                             "yes" if r.stable else "NO",
                             _f(ref.get("mean")), _f(ref.get("sd"), 4),
                             ch, _f(d.get("mean")), _f(d.get("sd"), 4),
-                            _f(d.get("error")), d.get("n", 0)))
+                            _f(d.get("error")),
+                            "" if d.get("tolerance") is None
+                            else f"±{d['tolerance']:g}",
+                            "" if verdict is None
+                            else ("PASS" if verdict else "FAIL"),
+                            d.get("n", 0)))
                 if d.get("error") is not None:
                     series[ch].append((r.setpoint, d["error"]))
         self.plot.show(
