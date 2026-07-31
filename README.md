@@ -1,12 +1,48 @@
 # Temperature Calibration Suite
 
-Automated multi-point temperature calibration: the PC drives the heat sources,
-the ADT286 does the measuring, and several calibrations can run at once —
-over USB, Ethernet, Wi-Fi, or Bluetooth.
+Automated multi-point temperature calibration. Your PC drives the heat
+sources, an Additel ADT286 does the measuring, and **several calibrations can
+run at the same time** — which the 286's own Probe Calibration app cannot do.
 
-## Install and run
+At each set point the software waits for the reference probe to settle, takes
+a run of samples from the reference and every device under test, records mean,
+standard deviation and error, then moves to the next point. When the run
+finishes you get a table, a graph, and two CSV files.
 
-Put **all nine .py files in one folder** — no subfolders needed — then:
+---
+
+## Contents
+
+- [Requirements](#requirements)
+- [Install and start](#install-and-start)
+- [Quick start](#quick-start)
+- [Connecting instruments](#connecting-instruments)
+- [Teaching it a heat source's commands](#teaching-it-a-heat-sources-commands)
+- [Building a calibration profile](#building-a-calibration-profile)
+- [Running calibrations](#running-calibrations)
+- [Results and export](#results-and-export)
+- [Terminal](#terminal)
+- [Supported heat sources](#supported-heat-sources)
+- [Troubleshooting](#troubleshooting)
+- [How it works](#how-it-works)
+- [Accuracy of the built-in command sets](#accuracy-of-the-built-in-command-sets)
+
+---
+
+## Requirements
+
+- **Python 3.8 or newer**, including tkinter (the GUI toolkit).
+  - Windows/macOS: use the installer from python.org and keep the
+    **tcl/tk and IDLE** option checked.
+  - Debian/Ubuntu: `sudo apt install python3-tk` · Fedora:
+    `sudo dnf install python3-tkinter`
+- **pyserial**: `pip install pyserial`
+- The **Additel USB driver**, if you connect the 286 or a well by USB, so the
+  instrument appears as a COM port.
+
+## Install and start
+
+Put all eight files in one folder and run the launcher:
 
 ```
 pip install pyserial
@@ -15,235 +51,281 @@ python run_calibration_suite.py
 
 ```
 your-folder/
-    run_calibration_suite.py     <- start this one
-    ui.py  engine.py  adt286.py  heatsource.py
-    transport.py  formats.py  export.py
-    heat_source_discovery.py     <- standalone serial format tool
+    run_calibration_suite.py    <- start this one
+    ui.py          engine.py     adt286.py    heatsource.py
+    transport.py   formats.py    export.py
 ```
 
-The launcher accepts either this flat layout or a `calsuite/` subfolder. If
-files are missing it names them instead of throwing an import error. Profile
-libraries (`heat_source_profiles.json`, `calibration_profiles.json`) are
-written next to the launcher, which is how the discovery tool and the suite
-share heat-source formats.
+The launcher works whether the seven modules sit flat beside it or inside a
+`calsuite/` subfolder, and if any are missing it names them instead of
+throwing an import error.
 
-Python needs tkinter for the window: it ships with the python.org installers
-(keep "tcl/tk and IDLE" checked); on Debian/Ubuntu `sudo apt install
-python3-tk`.
+Two files are created next to the launcher and grow as you work:
 
-## Connections: USB, Ethernet, Wi-Fi, Bluetooth
+| File | Holds |
+|---|---|
+| `heat_source_profiles.json` | each heat source: connection, range, command set, unit |
+| `calibration_profiles.json` | each calibration: channels, set points, stability and sampling settings |
 
-Every instrument — the 286 and each heat source — is reached through a
-**connection target**, so an instrument's command set is independent of how
-it is plugged in.
+## Quick start
 
-| Choice | What to enter | Notes |
+1. **Instruments** — connect the ADT286, then each heat source.
+2. Select a heat source and press **Check / discover commands** (once per
+   instrument, ever).
+3. **Profiles** — pick the heat source, the reference probe's channel, the DUT
+   channels, and type your set points. Press **Check this profile**.
+4. **Runs** — start it. Watch live readings; start another run on another heat
+   source if you want.
+5. **Results** — read the table and graph, then **Export CSV**.
+
+---
+
+## Connecting instruments
+
+Every instrument is reached through a *connection target*, so its command set
+is independent of the cable:
+
+| Connection | What to enter | Notes |
 |---|---|---|
-| USB / serial cable | COM port + baud | Install Additel's USB driver so the unit appears as a COM port |
-| Network (Ethernet / Wi-Fi) | IP address + socket port | **Find port** discovers the port for you |
-| Bluetooth (paired SPP port) | the COM port pairing created | Pair in the OS first; Windows exposes an outgoing COM port |
+| USB / serial | COM port and baud | Needs the Additel USB driver for Additel gear |
+| Ethernet / Wi-Fi | IP address and port | **Additel devices use port 8000** (the default here) |
+| Bluetooth | the COM port that pairing created | Pair in the OS first; Windows exposes an outgoing COM port |
 
-**Additel devices use port 8000**, which is the default here. If you are
-unsure, type the IP and press **Find port**: it asks each likely port (8000
-first, then 5025 — the IANA "scpi-raw" port used by most other lab gear —
-then 5000, 8080, 8888, 2000, 23, 1024, 10001) for its identity and fills in
-whichever answers `*IDN?`. Ports that are open but silent are ignored, so a stray web
-server cannot be mistaken for the instrument.
+**Find port** — if you don't know an instrument's socket port, type the IP and
+press it. It asks each likely port (8000 first, then 5025, 5000, 8080, 8888,
+2000, 23, 1024, 10001) for its identity and fills in whichever answers
+`*IDN?`. Ports that are open but silent are ignored, so a stray web server
+can't be mistaken for the instrument.
 
-**Bluetooth**: pairing a Serial Port Profile device creates a virtual COM
-port, and that is the reliable route on Windows — a Bluetooth target with a
-COM port is sent straight to the serial transport. A raw RFCOMM socket
-(entering a Bluetooth address instead) works on Linux only; elsewhere the app
-says so and points at the paired-port route. If a unit only exposes Bluetooth
-Low Energy to Additel's phone app, it is not reachable this way — use Wi-Fi or
-Ethernet.
+**Bluetooth** — pairing a Serial Port Profile device creates a virtual COM
+port, and that is the reliable route on Windows. A raw RFCOMM socket (entering
+a Bluetooth address instead of a port) works on Linux only; elsewhere the app
+says so rather than failing obscurely. A device that only exposes Bluetooth
+Low Energy to a phone app is not reachable this way — use Wi-Fi or Ethernet.
 
-## The Additel 878-160 and 878-700
+**Several identical wells** are told apart by their *connection*, not their
+model name. The first connects as "Additel 878-160"; a second at a different
+address becomes "Additel 878-160 SN «serial»", or "@ «address»" if it reports
+no serial. Only the *same address* twice is refused, and it names the source
+already using it.
 
-These default to a **network** connection when added, with ranges pre-filled
-(-40 to 160 °C and 33 to 700 °C).
+## Teaching it a heat source's commands
 
-**Additel does not use standard SCPI `SOURce:` naming.** In their published
-command sets the root keyword is the measured quantity itself: their pressure
-controller uses `PRESsure:TARGet <value>` for the set point and
-`PRESsure:MODE` for control state — there is no `SOURce` subsystem at all.
-That is why Fluke-style commands like `SOUR:SPO` are simply not recognised by
-an Additel well. The suite now tries Additel-style forms first:
+Different manufacturers use quite different remote command sets, so rather
+than assume, the software proves them against the instrument.
 
-```
-TEMPerature:TARGet?      TEMP:TARG?          set point (read)
-TEMPerature:TARGet <v>                       set point (write)
-TEMPerature?             TEMP?               live temperature
-UNIT:TEMPerature?                            unit
-TEMPerature:MODE?  / TEMPerature:MODE 1|0    heat/cool control
-```
+Connect the heat source, select it in the table, and press **Check / discover
+commands**. It tries candidate commands for the set point, temperature, unit
+and heat/cool control, keeps whichever the instrument actually answers, and
+confirms the set-point write by changing it slightly and reading it back
+before restoring the original value. The heat/cool command is found from its
+read-only query form and is **never actuated**. Whatever it proves is saved,
+so this is a one-time step per instrument.
 
-These are inferred from Additel's house style, not copied from the 878
-document, so **confirm them with Check / discover commands** rather than
-trusting them. Additel documents `SYSTem:ERRor?` as the way to tell whether a
-command was accepted, and discovery uses exactly that: it sends deliberate
-nonsense first to confirm the error queue works, then confirms every
-candidate with it. That is the only reliable way to test a command that
-returns nothing. Where an instrument has no error queue, it falls back to
-judging by replies.
+Two details it handles for you:
 
-Discovery is safe: only the set-point write changes anything, by a small
-delta that is then restored, and the heat/cool command is found from its
-read-only query form and never actuated.
+- **Verification by error queue.** A write command returns nothing, so its
+  reply proves nothing. Where an instrument keeps an error queue, each
+  candidate is confirmed with `SYSTem:ERRor?` — `0` means accepted, `-110`
+  means the header wasn't recognised. Instruments without an error queue fall
+  back to judging by replies.
+- **Set points that need a unit.** Additel wells report the set point as value
+  *and* unit (`60.0000,1001`) and require the unit back on a write; sent
+  without it they answer `-109 Missing parameter` and nothing changes. The
+  write template carries a `{unit}` placeholder:
 
-### Set-point commands that need the unit
+  ```
+  TEMPerature:TARGet {value},{unit}   ->   TEMPerature:TARGet 60.00,1001
+  ```
 
-Additel wells report the set point as **value and unit** — e.g.
-`TEMPerature:TARGet?` returns `60.0000,1001` — and the write command requires
-that unit back: `TEMPerature:TARGet 60.00,1001`. Sent without it, the
-instrument answers `-109 Missing parameter` and the set point never changes.
+  The unit is never hard-coded. It is taken from the instrument's own reply
+  and refreshed on every read, so a well switched to °F simply starts
+  reporting `1002` and that is what gets sent.
 
-The suite handles this with a `{unit}` placeholder in the write template:
+If a command can't be found automatically, the [Terminal](#terminal) will find
+it or let you enter it by hand.
 
-```
-TEMPerature:TARGet {value},{unit}     ->   TEMPerature:TARGet 60.00,1001
-```
+## Building a calibration profile
 
-The token is never hard-coded. It is taken from the instrument's own reply —
-the second field of the set-point read — and refreshed on every read, so a
-well switched to °F (`1002`) is followed automatically. Discovery tries both
-shapes and keeps whichever the readback proves, preferring the unit-bearing
-form when the read reply carries a unit. If nothing has reported a unit yet,
-the suite reads the set point once to obtain one before writing, and falls
-back to mapping the profile's display unit (°C = 1001, °F = 1002, K = 1000)
-only as a last resort. The adopted unit is saved with the profile, so later
-sessions work immediately.
+On the **Profiles** tab:
 
-To use it in a hand-written profile, just put `{unit}` in `sp_write` inside
-`heat_source_profiles.json`.
+| Setting | Meaning | Default |
+|---|---|---|
+| Heat source | which connected instrument drives the temperature | — |
+| Reference probe channel | the 286 channel your reference is on | — |
+| DUT channels | the channels being calibrated (multi-select) | — |
+| Set points | in the order they run, e.g. `0, 50, 100, 50, 0` | — |
+| Stability band | peak-to-peak the reference may move | 0.02 |
+| Window it must hold | how long it must stay that flat | 60 s |
+| Give up after | maximum wait for one point | 2400 s |
+| Soak after stable | extra dwell before sampling | 0 s |
+| Samples per set point | readings taken at each point | 10 |
+| Seconds between samples | interval between them | 5 s |
+| Enable output at start / off at end | whether to drive the heater remotely | on / on |
+| If a point never stabilises | `record` (flag it) or `abort` | record |
 
-### If discovery still comes up empty
+**Check this profile** validates everything before any hardware moves: channel
+assignments, duplicate or clashing channels, and whether every set point is
+inside that heat source's range. It also checks the stability settings against
+the 286's scan rate (see below).
 
-Use the **Terminal** tab. Its **Read set point / Read temperature / Read
-unit** buttons send whichever command that instrument actually uses, taken
-from its own profile rather than a hard-coded guess — so they work on an
-Additel well and a Fluke well alike, and say so plainly when a command has not
-been found yet. The **Find … command** buttons sweep every known form, report
-each verdict, and save the one that answers.
+A channel can belong to only one running calibration at a time; this is
+enforced when a run starts.
 
-You can also type any command directly: it shows the reply plus the
-`SYSTem:ERRor?` verdict — `0` means accepted, `-110`
-means the instrument did not recognise the command header. There are
-one-click buttons for the Additel and Fluke forms. Working through a few
-candidates there will find the syntax in a couple of minutes, and the
-authoritative list is in Additel's "Programming Commands for 878" PDF on
-their Product Resources page (support can email it if the download is
-blocked).
+## Running calibrations
 
-## Why this gets around the 286's one-profile limit
+Start as many runs as you have heat sources — one calibration per heat source.
+The **Runs** tab shows each run's phase, current set point, points completed,
+**the live reference reading and every DUT reading**. Select a run to open a
+per-channel panel underneath showing the reference and each device with its
+reading, its live error against the reference, and how old the reading is.
+
+> The live error is for monitoring only. Recorded results are the means over
+> the samples taken at each set point, after stability is met.
+
+**STOP EVERYTHING** halts all runs and switches outputs off where the profile
+allows.
+
+### What "stable" means
+
+The software watches the **reference probe** through the 286 — not the well's
+internal sensor. A point is stable once it has been watched for at least the
+window *and* the most recent window of readings is flat within the band.
+
+A point that never stabilises is, by default, sampled anyway and marked
+**NOT STABLE** in the table and `NO` in the CSV, so a long run isn't lost but
+bad data can't pass as good. Choose `abort` if you'd rather the run stop.
+
+### Using the 286 by hand during a run
+
+You can. The 286 keeps a single scan configuration, so switching its display
+to another function cancels the scan and readings stop. The software watches
+for this: after three polls with no data — or with subscribed channels missing
+— it re-sends the scan command and carries on. Recovery is rate-limited so it
+can't become a restart storm, it's announced in the Activity log, and the Runs
+tab shows live scan health ("scanning", "no data — recovering",
+"recovered 2×"). Runs survive the interruption; a stability window just takes
+a little longer to fill. Reading age in the live panel is the honest indicator
+that something was interrupted.
+
+### Scan rate and stability windows
+
+**Read channels every** on the Instruments tab (0.5 / 1 / 2 / 5 / 10 s) sets
+how often the 286 is scanned. Slower polling leaves the instrument freer for
+hands-on use.
+
+There's a coupling worth knowing: stability needs **at least three readings
+inside the window**, so a window shorter than three read intervals can never
+be satisfied — every set point would time out even with a perfectly steady
+bath. "Check this profile" catches this before a run and says what to use;
+changing the read interval reports the new minimum and warns if a running
+profile's window has become too short. The same applies to a sample interval
+faster than the scan.
+
+## Results and export
+
+The **Results** tab shows a row per set point per DUT channel — reference mean
+and standard deviation, DUT mean and standard deviation, error, sample count,
+and whether the point was stable — plus a graph of error against set point per
+channel with a zero line.
+
+**Export CSV** writes two files into a folder you choose:
+
+- `«run»_«timestamp»_summary.csv` — the calibration table
+- `«run»_«timestamp»_samples.csv` — every individual reading
+
+Both begin with full metadata: instrument identities, connections, ranges,
+channel assignments, set points, and the stability and sampling settings used.
+
+## Terminal
+
+For hands-on work with any connected instrument, over whichever connection it
+uses.
+
+- **Read set point / Read temperature / Read unit** send whichever command
+  *that* instrument uses, taken from its own profile — so they work on an
+  Additel well and a Fluke well alike, and say so plainly if a command hasn't
+  been found yet.
+- **Find … command** sweeps every known form, reports each verdict, and saves
+  the one that answers.
+- Type any command directly to test it. With the error-queue box ticked, each
+  command is followed by `SYSTem:ERRor?` and the verdict shown: accepted, or
+  rejected with the instrument's own error text.
+
+## Supported heat sources
+
+Selecting one of these pre-fills its range and, where known, its command set.
+Anything else can be added by connecting it and running discovery.
+
+| Model | Type | Range (°C) |
+|---|---|---|
+| Fluke 9190A | Ultra-cool field metrology well | −95 to 140 |
+| Fluke 9170 / 9171 | Field metrology well | −45 to 140 / −30 to 155 |
+| Fluke 9172 / 9173 | Metrology well | 35 to 425 / 50 to 700 |
+| Fluke 9142 / 9143 / 9144 | Field metrology well | −25 to 150 / 33 to 350 / 50 to 660 |
+| Fluke 6109A / 7109A | Portable calibration bath | 35 to 250 / −25 to 140 |
+| Additel 878-160 / 878-425 / 878-700 | Reference dry well | −40 to 160 / 33 to 425 / 33 to 700 |
+| Fluke 7102 / 7103 / 6102 | Micro-bath | −5 to 125 / −30 to 125 / 35 to 200 |
+
+Ranges come from the manufacturers' datasheets — confirm against the
+nameplate, since the software refuses set points outside the range you set.
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| "No module named calsuite" | A file is missing or misplaced. Put all eight files in one folder; the launcher names anything absent. |
+| Readings stop mid-run | The 286's display was changed, cancelling the scan. It recovers automatically within a few seconds — watch the scan health indicator. |
+| Every set point times out, but the bath looks steady | The stability window is too short for the scan rate. Use at least three read intervals, or scan faster. |
+| No set-point command recognised | Run **Check / discover commands**. If it still fails, use the Terminal's **Find set-point command**, then type candidates by hand. |
+| `-109 Missing parameter` on a write | The instrument needs the unit with the value. Re-run discovery; it will adopt the `{unit}` form. |
+| `-110 Command header error` | Wrong command for this instrument — the dialect differs by manufacturer. |
+| Set point won't change | It may be locked on the instrument. Tick "Send password before set points", or unlock it on the panel. |
+| Second identical well won't connect | Only the same *address* is refused. Check you changed the IP or port. |
+| Well never heats | Micro-baths have no remote output enable; switch it on at the front panel. Fluke wells reset their output to off at power-up. |
+| Nothing answers over the network | Check the IP, that the network interface is on, and press **Find port**. |
+
+## How it works
 
 The 286's built-in Probe Calibration app runs one profile at a time. This
-suite inverts the arrangement: the PC owns the sequencing and drives each heat
-source directly, while the 286 is used purely as the readout. The heat sources
-never need to be presets on the 286 at all, which also sidesteps the
-Temperature Source Management gap entirely.
+software inverts the arrangement: the PC owns the sequencing and drives each
+heat source directly, using the 286 purely as the readout. The heat sources
+never need to be presets on the 286 at all.
 
-**The one real constraint** is that the 286 has a single scan configuration —
-`SCAN:MULT:STARt` takes one channel list, so concurrent runs cannot each start
-their own scan. Every run *subscribes* its channels to one shared scan and
-readings are fanned out by channel name; one poll serves everyone.
-Consequences:
+The one real constraint is that **the 286 holds a single scan configuration**,
+so concurrent runs can't each start their own scan. Every run subscribes its
+channels to one shared scan, and readings are fanned out by channel name — one
+poll serves everyone. That is why channels are locked to a run while it is
+active, why starting or finishing a run briefly reconfigures the scan, and why
+the live readings on the Runs tab cost nothing extra.
 
-- **Channels are locked to a run while it is active.** A `ChannelRegistry`
-  refuses to start a run whose reference or DUT channel is already claimed.
-- **Starting or finishing a run reconfigures the shared scan**, pausing data
-  for about a second. Harmless — the engine waits for fresh scan cycles.
-- **The suite never changes the 286's channel setup or units.** Those are
-  global, so changing them mid-flight would corrupt another run's data. Set
-  sensor types on the instrument beforehand; the suite reads and displays them
-  so you can confirm assignments.
+The software never changes the 286's channel setup or its units. Those are
+global, so altering them mid-flight would corrupt another run's data — set
+sensor types on the instrument beforehand. Channels are shown with their
+configured type so you can confirm assignments.
 
-## Workflow
+## Accuracy of the built-in command sets
 
-1. **Instruments** — connect the 286, then each heat source on its own
-   connection. Channels are enumerated from the module inventory and shown
-   with their configured sensor type.
-2. **Profiles** — name the run, pick the heat source, the reference probe's
-   channel, and the DUT channels; enter set points in order (e.g.
-   `0, 50, 100, 50, 0`). Set the stability band and window, samples per point,
-   and interval. "Check this profile" validates everything — including that
-   every set point is inside the heat source's range — before hardware moves.
-3. **Runs** — start as many as you have heat sources for. The table shows each
-   run's phase, current set point, points completed, and live reference
-   reading. STOP EVERYTHING halts all runs and switches outputs off where the
-   profile allows.
-4. **Results** — table of every set point x DUT channel with reference mean,
-   DUT mean, standard deviations and error; graph of error against set point
-   per channel. Export writes two CSVs: a summary (the calibration table) and
-   every raw sample, both with full run metadata.
+- **ADT286** — from Additel's published command set (`MODule:INFormation?`,
+  `MODule:CONFig?`, `SCAN:MULT:STARt`, `SCAN:DATA:Last?`, `SCAN:STOP`,
+  `UNIT:TEMPerature?`). The scan-data parser is tested against Additel's own
+  worked example and tolerates the longer thermocouple form with cold-junction
+  fields appended.
+- **Fluke 917X wells and 6109A/7109A baths** — from their manuals.
+- **Hart Scientific micro-baths** (`t`, `s=`, `u`) — from long-standing
+  convention, not a manual.
+- **Additel wells** — inferred from Additel's house style in their published
+  command sets, where the root keyword is the quantity itself
+  (`TEMPerature:TARGet`, not `SOURce:SPOint`). **Not** copied from the 878
+  document.
 
-## What "stable" means here
+The last two are exactly why discovery exists: run **Check / discover
+commands** and let the instrument settle it before trusting a run to it. The
+authoritative lists are the "Programming Commands" PDFs on Additel's Product
+Resources page, and the manuals for Fluke gear.
 
-Per set point the engine sends the set point, confirms it by readback, then
-watches the **reference probe** (read through the 286, not the well's internal
-sensor). A point is stable when it has been watched for at least the window
-and the most recent window of readings is flat within the band. If a point
-never stabilises within "give up after", the default is to sample anyway and
-mark the result **NOT STABLE** — visible in the table and as `NO` in the CSV —
-so a long run is not lost but bad data cannot masquerade as good. Set it to
-`abort` if you would rather the run stop.
-
-## Verified against the documentation
-
-The 286 commands come from Additel's published command set:
-`MODule:INFormation?`, `MODule:CONFig?`, `SCAN:MULT:STARt`,
-`SCAN:DATA:Last?`, `SCAN:STOP`, `UNIT:TEMPerature?`. The scan-data parser is
-tested against Additel's own worked example
-(`REF1,1281,1,28.258167,28.258167,1001,1,33.512077;` -> 33.512077 °C) and
-tolerates the longer thermocouple form with cold-junction blocks appended.
-Fluke 917X and 6109A/7109A command sets are from their manuals. The classic
-Micro-Bath syntax (`t`, `s=`, `u`) is convention-derived, and the Additel 878
-syntax is left to live discovery — verify both before trusting a run to them.
-
-## Using the 286 by hand during a run
-
-The 286 keeps a single scan configuration, so switching its display to
-another function cancels the scan and readings stop. The suite watches for
-that: after a few polls with no data (or with subscribed channels missing) it
-re-sends `SCAN:MULT:STARt` and carries on. Recovery is rate-limited so it
-cannot become a restart storm, it is announced in the Activity log, and the
-Runs tab shows live scan health ("scanning", "no data - recovering",
-"recovered 2x"). Runs survive the interruption; a stability window simply
-takes a little longer to fill.
-
-You can also slow the scan down — **Read channels every** on the Instruments
-tab (0.5 / 1 / 2 / 5 / 10 s) — which leaves the instrument freer for hands-on
-use. Remember the stability window must stay at least three read intervals
-long; changing the rate says what the new minimum is, and warns if a running
-profile's window has become too short.
-
-## Several identical wells
-
-Two 878-160s are told apart by their **connection**, not their model name. The
-first connects as "Additel 878-160"; a second at a different address becomes
-"Additel 878-160 SN <serial>" (or "@ <address>" if it reports no serial), and
-both appear separately with their own profiles and runs. Only the *same
-address* twice is refused, naming the source already using it.
-
-## Stability window vs scan rate
-
-The 286 is scanned about once a second, and stability needs at least three
-readings inside the window, so a window shorter than ~3 s can never be
-satisfied — every set point would time out even with a perfectly steady bath.
-"Check this profile" catches that before a run starts and says what to use
-instead, and the same applies to a sample interval faster than the scan.
-Timeout notes now distinguish "never had enough readings to judge" from
-"readings were not flat enough", so a real timeout is not confused with a
-misconfigured one.
-
-## Limits worth knowing before the first real run
-
-- **Micro-Baths have no remote output enable.** The suite detects this, warns
-  clearly, and relies on the front panel rather than assuming the bath heats.
-- **One calibration per heat source.** Enforced.
-- **Sampling rate is bounded by the scan poll** (1 s default).
-- **Ranges are pre-filled from datasheets** — confirm against the nameplate.
-- Tested end-to-end against simulated instruments — two wells sharing one 286
-  over serial, and a full run driving a well over a real TCP socket — but not
-  yet against your hardware. The Activity log records every exchange, so
-  anything surprising is diagnosable.
+The software has been tested end-to-end against simulated instruments —
+including concurrent runs sharing one 286, a well driven over a real TCP
+socket, an instrument that requires the unit ID, and a 286 whose scan is
+cancelled mid-run — but not against your bench. The Activity log records every
+exchange, so anything unexpected is diagnosable.

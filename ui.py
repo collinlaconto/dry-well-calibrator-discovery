@@ -377,6 +377,7 @@ class SuiteApp(tk.Tk):
         except queue.Empty:
             pass
         self._refresh_run_table()
+        self._refresh_live_panel()
         try:
             health = self.adt.health
             colour = ("#b00020" if "no data" in health
@@ -643,17 +644,35 @@ class SuiteApp(tk.Tk):
         self.lbl_scan.pack(side="right", padx=12)
 
         cols = ("name", "source", "state", "phase", "setpoint", "progress",
-                "reference")
+                "reference", "duts")
         self.tbl_runs = ttk.Treeview(t, columns=cols, show="headings",
-                                     height=10)
-        for c, w, txt in (("name", 190, "Run"), ("source", 170, "Heat source"),
-                          ("state", 90, "State"), ("phase", 160, "Phase"),
-                          ("setpoint", 90, "Set point"),
-                          ("progress", 110, "Points done"),
-                          ("reference", 130, "Reference now")):
+                                     height=8)
+        for c, w, txt in (("name", 160, "Run"), ("source", 140, "Heat source"),
+                          ("state", 80, "State"), ("phase", 140, "Phase"),
+                          ("setpoint", 80, "Set point"),
+                          ("progress", 90, "Points done"),
+                          ("reference", 110, "Reference now"),
+                          ("duts", 260, "Devices under test")):
             self.tbl_runs.heading(c, text=txt)
             self.tbl_runs.column(c, width=w, anchor="w")
         self.tbl_runs.pack(fill="both", expand=True, padx=8, pady=6)
+        self.tbl_runs.bind("<<TreeviewSelect>>",
+                           lambda e: self._refresh_live_panel())
+
+        live = ttk.LabelFrame(t, text="Live channel readings")
+        live.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+        lcols = ("channel", "role", "reading", "error", "age")
+        self.tbl_live = ttk.Treeview(live, columns=lcols, show="headings",
+                                     height=7)
+        for c, w, txt in (("channel", 150, "Channel"), ("role", 130, "Role"),
+                          ("reading", 130, "Reading"),
+                          ("error", 150, "Error vs reference"),
+                          ("age", 110, "Reading age")):
+            self.tbl_live.heading(c, text=txt)
+            self.tbl_live.column(c, width=w, anchor="w")
+        self.tbl_live.pack(fill="both", expand=True, padx=6, pady=6)
+        self.lbl_live_note = ttk.Label(live, text="", foreground="#555")
+        self.lbl_live_note.pack(fill="x", padx=8, pady=(0, 6))
         ttk.Label(t, foreground="#555", wraplength=1000, justify="left",
                   text=("Runs share the one 286: their channels are scanned "
                         "together and the readings fanned out. Starting or "
@@ -1373,17 +1392,77 @@ class SuiteApp(tk.Tk):
         self._log("WARN", f"Stopping {len(active)} run(s); outputs will be "
                           "switched off where the profile allows.")
 
+    def _live(self, channel):
+        """(value, age_seconds) for a channel from the shared scan."""
+        try:
+            reading = self.adt.latest(channel)
+        except Exception:
+            return (None, None)
+        if reading is None or reading.temperature is None:
+            return (None, None)
+        return (reading.temperature, max(0.0, time.time() - reading.timestamp))
+
+    def _refresh_live_panel(self):
+        """Reference and DUT readings for the selected (or only) run."""
+        for row in self.tbl_live.get_children():
+            self.tbl_live.delete(row)
+        run_id = self._selected_run_id()
+        engine = self.engines.get(run_id)
+        if engine is None:
+            active = [e for e in self.engines.values() if e.is_active]
+            engine = active[0] if len(active) == 1 else None
+        if engine is None:
+            self.lbl_live_note.configure(
+                text="Select a run above to see its channels.")
+            return
+        unit = getattr(self.adt, "unit", "") or "°C"
+        ref_ch = engine.profile.get("reference_channel", "")
+        ref_value, ref_age = self._live(ref_ch)
+        rows = [(ref_ch, "reference probe", ref_value, None, ref_age)]
+        for ch in engine.profile.get("dut_channels", []):
+            value, age = self._live(ch)
+            error = (None if value is None or ref_value is None
+                     else value - ref_value)
+            rows.append((ch, "device under test", value, error, age))
+        stale = False
+        for channel, role, value, error, age in rows:
+            if age is not None and age > 10:
+                stale = True
+            self.tbl_live.insert(
+                "", "end",
+                values=(channel, role,
+                        "—" if value is None else f"{value:.3f} {unit}",
+                        "" if error is None else f"{error:+.3f} {unit}",
+                        "—" if age is None else f"{age:.0f} s ago"))
+        name = engine.profile.get("name", "")
+        if stale:
+            self.lbl_live_note.configure(
+                text=f"{name}: readings are going stale — the 286's scan may "
+                     "have been interrupted. It is being re-established "
+                     "automatically.")
+        else:
+            self.lbl_live_note.configure(
+                text=f"{name}: live from the shared scan, updated every "
+                     f"{getattr(self.adt, 'poll_interval', 1):g} s.")
+
     def _refresh_run_table(self):
         existing = set(self.tbl_runs.get_children())
         for run_id, eng in self.engines.items():
-            ref = ("" if eng.last_reference is None
-                   else f"{eng.last_reference:.3f}")
+            ref_value, _age = self._live(eng.profile.get("reference_channel"))
+            if ref_value is None:
+                ref_value = eng.last_reference
+            ref = "" if ref_value is None else f"{ref_value:.3f}"
+            duts = []
+            for ch in eng.profile.get("dut_channels", []):
+                value, _ = self._live(ch)
+                duts.append(f"{ch} —" if value is None
+                            else f"{ch} {value:.3f}")
             values = (eng.profile.get("name", ""), eng.heat_source.name,
                       eng.state, eng.phase,
                       "" if eng.current_setpoint is None
                       else f"{eng.current_setpoint:g}",
                       f"{len(eng.results)}/{len(eng.profile.get('setpoints', []))}",
-                      ref)
+                      ref, "   ".join(duts))
             if run_id in existing:
                 self.tbl_runs.item(run_id, values=values)
             else:
