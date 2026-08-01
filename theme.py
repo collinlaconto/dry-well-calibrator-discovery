@@ -331,7 +331,8 @@ class PageStack(ttk.Frame):
     pages themselves did not have to be rewritten.
     """
 
-    def __init__(self, master, title="Calibration Suite", subtitle=None,
+    def __init__(self, master, title="Calibration Automation Suite",
+                 subtitle=None,
                  groups=None, **kw):
         super().__init__(master, **kw)
         self.groups = groups or {}

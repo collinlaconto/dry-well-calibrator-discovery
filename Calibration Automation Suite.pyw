@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Launch the Temperature Calibration Suite.
+"""Launch the Calibration Automation Suite.
 
-Windows: double-click "Calibration Suite.pyw" - it opens the window with no
+Windows: double-click "Calibration Automation Suite.pyw" - it opens with no
 console behind it. Running this file with python.exe also works; the console
 it creates is hidden automatically.
 
@@ -139,7 +139,7 @@ def alert(title, message):
 
 
 def complain(folder, missing):
-    alert("Calibration Suite - files are missing",
+    alert("Calibration Automation Suite - files are missing",
           "Looked in:\n  " + folder + "\n\nMissing:\n  "
           + ", ".join(m + ".py" for m in missing)
           + "\n\nPut all of these next to the launcher (or in a folder "
@@ -166,7 +166,7 @@ def main():
         from calsuite.ui import main as run_ui
     except ImportError as exc:
         if "tkinter" in str(exc).lower():
-            alert("Calibration Suite - tkinter is missing",
+            alert("Calibration Automation Suite - tkinter is missing",
                   "This Python was installed without tkinter, which the "
                   "window needs.\n\n"
                   "Windows/macOS: reinstall Python from python.org and keep "
@@ -176,7 +176,7 @@ def main():
             sys.exit(1)
         raise
     except Exception as exc:
-        alert("Calibration Suite - could not start", str(exc))
+        alert("Calibration Automation Suite - could not start", str(exc))
         raise
     run_ui()
 

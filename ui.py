@@ -22,7 +22,7 @@ from .transport import (CANDIDATE_TCP_PORTS, DEFAULT_TCP_PORT,
                         available_ports, describe_target, find_tcp_port,
                         normalize_target, target_is_set)
 
-APP_TITLE = "Temperature Calibration Suite — ADT286 + heat sources"
+APP_TITLE = "Calibration Automation Suite"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Profile libraries live beside run_calibration_suite.py. That is HERE's
 # parent when the modules are in a calsuite/ folder, and HERE itself when
@@ -412,7 +412,7 @@ class SuiteApp(tk.Tk):
     # ----------------------------------------------------------------- UI --
     def _build_ui(self):
         self.nb = theme.PageStack(
-            self, title="Calibration Suite",
+            self, title="Calibration Automation Suite",
             groups={0: "Set up", 1: "Calibrate", 3: "Records", 5: "Tools"})
         self.nb.pack(fill="both", expand=True)
         self._build_instruments_tab()

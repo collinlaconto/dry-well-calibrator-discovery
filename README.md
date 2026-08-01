@@ -1,4 +1,4 @@
-# Datum — Calibration Suite
+# Calibration Automation Suite
 
 Automated multi-point temperature calibration. Your PC drives the heat
 sources, an Additel ADT286 does the measuring, and **several calibrations can
@@ -43,7 +43,7 @@ finishes you get a table, a graph, and two CSV files.
 ## Install and start
 
 Put all eleven files in one folder, install pyserial once, then
-**double-click `Calibration Suite.pyw`**.
+**double-click `Calibration Automation Suite.pyw`**.
 
 ```
 pip install pyserial
@@ -54,8 +54,8 @@ pip install pandas plotly openpyxl
 
 ```
 your-folder/
-    Calibration Suite.pyw       <- double-click this
-    run_calibration_suite.py    <- same app, from a command prompt
+    Calibration Automation Suite.pyw   <- double-click this
+    run_calibration_suite.py           <- same app, from a command prompt
     ui.py        theme.py       engine.py     adt286.py
     heatsource.py               transport.py  formats.py    export.py
     datasync.py
@@ -351,7 +351,7 @@ nameplate, since the software refuses set points outside the range you set.
 | Symptom | Cause and fix |
 |---|---|
 | "No module named calsuite" | A file is missing or misplaced. Put all eleven files in one folder; the launcher names anything absent in a dialog. |
-| A console window sits behind the app | Start `Calibration Suite.pyw`. If one still appears, Windows may be opening `.pyw` files with `python.exe`: right-click the file, Open with, and choose `pythonw.exe`. The `.py` launcher also hides its own console and, failing that, restarts itself windowless. Set `CALSUITE_KEEP_CONSOLE=1` to keep the console for debugging. |
+| A console window sits behind the app | Start `Calibration Automation Suite.pyw`. If one still appears, Windows may be opening `.pyw` files with `python.exe`: right-click the file, Open with, and choose `pythonw.exe`. The `.py` launcher also hides its own console and, failing that, restarts itself windowless. Set `CALSUITE_KEEP_CONSOLE=1` to keep the console for debugging. |
 | Readings stop mid-run | The 286's display was changed, cancelling the scan. It recovers automatically within a few seconds — watch the scan health indicator. |
 | Every set point times out, but the bath looks steady | The stability window is too short for the scan rate. Use at least three read intervals, or scan faster. |
 | No set-point command recognised | Run **Check / discover commands**. If it still fails, use the Terminal's **Find set-point command**, then type candidates by hand. |
