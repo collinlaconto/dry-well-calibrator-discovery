@@ -18,7 +18,7 @@ import types
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 MODULES = ("transport", "formats", "adt286", "heatsource", "engine",
-           "export", "theme", "ui")
+           "export", "theme", "datasync", "ui")
 
 
 def hide_console():

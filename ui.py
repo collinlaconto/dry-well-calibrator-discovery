@@ -11,7 +11,7 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, scrolledtext
 
-from . import export, theme
+from . import datasync, export, theme
 from .adt286 import Adt286
 from .engine import (ChannelRegistry, RunEngine, default_profile,
                      tolerance_at, validate_profile, STATE_RUNNING)
@@ -419,6 +419,7 @@ class SuiteApp(tk.Tk):
         self._build_profiles_tab()
         self._build_runs_tab()
         self._build_results_tab()
+        self._build_compare_tab()
         self._build_terminal_tab()
         self._build_activity_tab()
 
@@ -807,9 +808,346 @@ class SuiteApp(tk.Tk):
         self.plot.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
     # --- tab 5: terminal ---------------------------------------------------
+    def _build_compare_tab(self):
+        """Compare data loggers against a reference probe."""
+        t = ttk.Frame(self.nb)
+        self.nb.add(t, text=" 5 · Logger comparison ")
+        _h = ttk.Frame(t)
+        _h.pack(fill="x", padx=18, pady=(18, 10))
+        ttk.Label(_h, text="Logger comparison",
+                  style="Title.TLabel").pack(anchor="w")
+        ttk.Label(_h, style="Dim.TLabel", wraplength=880, justify="left",
+                  text="Plot data loggers against a reference probe on one "
+                       "time axis. Timestamp and temperature columns are found "
+                       "automatically in almost any export."
+                  ).pack(anchor="w", pady=(2, 0))
+
+        if not datasync.HAS_PANDAS:
+            note = theme.Panel(t)
+            note.pack(fill="x", padx=18, pady=8)
+            ttk.Label(note.inner, style="Card.TLabel", justify="left",
+                      wraplength=760,
+                      text="This tool needs two extra libraries:\n\n"
+                           "    pip install pandas plotly openpyxl\n\n"
+                           "Install them and restart. Everything else in the "
+                           "application works without them."
+                      ).pack(anchor="w")
+            return
+
+        # --- reference -----------------------------------------------------
+        ref = ttk.LabelFrame(t, text="Reference")
+        ref.pack(fill="x", padx=18, pady=(0, 8))
+        pad = {"padx": 6, "pady": 4}
+        self.var_ref_source = tk.StringVar(value="run")
+        ttk.Radiobutton(ref, text="A calibration run from this application",
+                        variable=self.var_ref_source, value="run",
+                        command=self._sync_compare_source).grid(
+            row=0, column=0, sticky="w", **pad)
+        self.var_cmp_run = tk.StringVar()
+        self.cbo_cmp_run = ttk.Combobox(ref, textvariable=self.var_cmp_run,
+                                        width=34, state="readonly")
+        self.cbo_cmp_run.grid(row=0, column=1, sticky="w", **pad)
+        theme.Button(ref, text="Refresh",
+                     command=self._refresh_compare_runs).grid(row=0, column=2,
+                                                              **pad)
+        ttk.Radiobutton(ref, text="A probe file", variable=self.var_ref_source,
+                        value="file",
+                        command=self._sync_compare_source).grid(
+            row=1, column=0, sticky="w", **pad)
+        self.var_probe_path = tk.StringVar()
+        self.ent_probe = ttk.Entry(ref, textvariable=self.var_probe_path,
+                                   width=42)
+        self.ent_probe.grid(row=1, column=1, sticky="w", **pad)
+        theme.Button(ref, text="Choose…",
+                     command=self._pick_probe).grid(row=1, column=2, **pad)
+        self.lbl_probe_cols = ttk.Label(ref, style="Dim.TLabel", text="")
+        self.lbl_probe_cols.grid(row=2, column=0, columnspan=3, sticky="w",
+                                 padx=6, pady=(0, 4))
+        self.lbl_start = ttk.Label(ref, style="Dim.TLabel",
+                                   text="Start time (YYYY-MM-DD HH:MM:SS)")
+        self.var_start = tk.StringVar()
+        self.ent_start = ttk.Entry(ref, textvariable=self.var_start, width=24)
+
+        # --- loggers -------------------------------------------------------
+        dev = ttk.LabelFrame(t, text="Data loggers")
+        dev.pack(fill="both", expand=True, padx=18, pady=8)
+        bar = ttk.Frame(dev)
+        bar.pack(fill="x", padx=6, pady=6)
+        theme.Button(bar, text="Add files…",
+                     command=self._add_logger_files).pack(side="left")
+        theme.Button(bar, text="Remove selected",
+                     command=self._remove_logger).pack(side="left", padx=8)
+        theme.Button(bar, text="Clear",
+                     command=self._clear_loggers).pack(side="left")
+        cols = ("file", "time", "value", "rows")
+        self.tbl_loggers = ttk.Treeview(dev, columns=cols, show="headings",
+                                        height=6)
+        for c, w, txt in (("file", 280, "File"), ("time", 200, "Time column"),
+                          ("value", 200, "Temperature column"),
+                          ("rows", 90, "Rows")):
+            self.tbl_loggers.heading(c, text=txt)
+            self.tbl_loggers.column(c, width=w, anchor="w")
+        self.tbl_loggers.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.logger_files = {}          # iid -> {path, info, time, value}
+        self.tbl_loggers.bind("<<TreeviewSelect>>",
+                              lambda e: self._show_logger_columns())
+
+        edit = ttk.Frame(dev)
+        edit.pack(fill="x", padx=6, pady=(0, 8))
+        ttk.Label(edit, text="Time column").pack(side="left")
+        self.var_log_time = tk.StringVar()
+        self.cbo_log_time = ttk.Combobox(edit, textvariable=self.var_log_time,
+                                         width=22, state="readonly")
+        self.cbo_log_time.pack(side="left", padx=(4, 12))
+        ttk.Label(edit, text="Temperature column").pack(side="left")
+        self.var_log_value = tk.StringVar()
+        self.cbo_log_value = ttk.Combobox(edit, textvariable=self.var_log_value,
+                                          width=22, state="readonly")
+        self.cbo_log_value.pack(side="left", padx=4)
+        theme.Button(edit, text="Apply to selected",
+                     command=self._apply_logger_columns).pack(side="left",
+                                                              padx=8)
+        ttk.Label(dev, style="Dim.TLabel", wraplength=880, justify="left",
+                  text="Columns are detected automatically; override them here "
+                       "if a file is unusual. Loggers are trimmed to the "
+                       "reference's time window before charting."
+                  ).pack(anchor="w", padx=8, pady=(0, 6))
+
+        # --- output --------------------------------------------------------
+        out = ttk.Frame(t)
+        out.pack(fill="x", padx=18, pady=(0, 14))
+        theme.Button(out, text="Build chart", style="Primary.TButton",
+                     command=self._build_comparison).pack(side="left")
+        self.lbl_compare = ttk.Label(out, style="Dim.TLabel", text="")
+        self.lbl_compare.pack(side="left", padx=12)
+        self._sync_compare_source()
+
+    # ------------------------------------------------------ compare page ---
+    def _sync_compare_source(self):
+        from_run = self.var_ref_source.get() == "run"
+        self.cbo_cmp_run.configure(state="readonly" if from_run else "disabled")
+        self.ent_probe.configure(state="disabled" if from_run else "normal")
+        if from_run:
+            self.lbl_start.grid_remove()
+            self.ent_start.grid_remove()
+            self._refresh_compare_runs()
+        elif getattr(self, "_probe_needs_start", False):
+            self.lbl_start.grid(row=3, column=0, sticky="e", padx=6, pady=4)
+            self.ent_start.grid(row=3, column=1, sticky="w", padx=6, pady=4)
+
+    def _refresh_compare_runs(self):
+        labels = []
+        for run_id, eng in self.engines.items():
+            if eng.results:
+                labels.append(f"{eng.profile.get('name', '')} ({run_id}) — "
+                              f"{datasync.sample_count(eng)} samples")
+        self.cbo_cmp_run["values"] = labels
+        if labels and self.var_cmp_run.get() not in labels:
+            self.var_cmp_run.set(labels[-1])
+        if not labels:
+            self.lbl_probe_cols.configure(
+                text="No finished calibration runs yet — run one, or choose a "
+                     "probe file instead.")
+
+    def _pick_probe(self):
+        path = filedialog.askopenfilename(
+            title="Choose the reference probe file",
+            filetypes=[("Data files", "*.csv *.txt *.xlsx"), ("All", "*.*")])
+        if not path:
+            return
+        self.var_probe_path.set(path)
+        self.var_ref_source.set("file")
+        try:
+            info = datasync.analyze_file(path)
+        except Exception as e:
+            messagebox.showerror("Could not read the file", str(e))
+            return
+        self._probe_info = info
+        self._probe_needs_start = info["needs_start"]
+        self.lbl_probe_cols.configure(
+            text=f"Detected time '{info['time_guess']}', temperature "
+                 f"'{info['value_guess']}'"
+            + ("  ·  this file uses elapsed time, so a start time is needed"
+               if info["needs_start"] else ""))
+        self._sync_compare_source()
+
+    def _add_logger_files(self):
+        paths = filedialog.askopenfilenames(
+            title="Choose logger files",
+            filetypes=[("Data files", "*.csv *.txt *.xlsx"), ("All", "*.*")])
+        existing = {e["path"] for e in self.logger_files.values()}
+        for path in paths:
+            if path in existing:
+                continue
+            try:
+                info = datasync.analyze_file(path)
+            except Exception as e:
+                self._log("FAIL", f"{os.path.basename(path)}: {e}")
+                continue
+            iid = self.tbl_loggers.insert(
+                "", "end",
+                values=(os.path.basename(path),
+                        info["time_guess"] or "(not found)",
+                        info["value_guess"] or "(not found)",
+                        len(info["df"])))
+            self.logger_files[iid] = {"path": path, "info": info,
+                                      "time": None, "value": None}
+            self._log("INFO", f"{os.path.basename(path)}: time "
+                              f"'{info['time_guess']}', temperature "
+                              f"'{info['value_guess']}'")
+
+    def _selected_logger(self):
+        sel = self.tbl_loggers.selection()
+        return self.logger_files.get(sel[0]) if sel else None
+
+    def _show_logger_columns(self):
+        entry = self._selected_logger()
+        if not entry:
+            return
+        info = entry["info"]
+        times = list(info["columns"])
+        guess = info["time_guess"]
+        if guess and guess not in times:
+            times = [guess] + times
+        self.cbo_log_time["values"] = times
+        self.cbo_log_value["values"] = info["value_options"] or info["columns"]
+        self.var_log_time.set(entry["time"] or guess or "")
+        self.var_log_value.set(entry["value"] or info["value_guess"] or "")
+
+    def _apply_logger_columns(self):
+        sel = self.tbl_loggers.selection()
+        entry = self._selected_logger()
+        if not entry:
+            messagebox.showinfo("Nothing selected",
+                                "Select a file in the list first.")
+            return
+        entry["time"] = self.var_log_time.get().strip() or None
+        entry["value"] = self.var_log_value.get().strip() or None
+        self.tbl_loggers.item(
+            sel[0], values=(os.path.basename(entry["path"]),
+                            entry["time"] or entry["info"]["time_guess"],
+                            entry["value"] or entry["info"]["value_guess"],
+                            len(entry["info"]["df"])))
+
+    def _remove_logger(self):
+        for iid in self.tbl_loggers.selection():
+            self.tbl_loggers.delete(iid)
+            self.logger_files.pop(iid, None)
+
+    def _clear_loggers(self):
+        for iid in list(self.logger_files):
+            self.tbl_loggers.delete(iid)
+        self.logger_files.clear()
+
+    def _build_comparison(self):
+        if not self.logger_files:
+            messagebox.showinfo("Nothing to compare",
+                                "Add at least one logger file.")
+            return
+        from_run = self.var_ref_source.get() == "run"
+        probe_series = None
+        probe_path = None
+        start = None
+
+        if from_run:
+            label = self.var_cmp_run.get()
+            engine = next((e for rid, e in self.engines.items()
+                           if f"({rid})" in label), None)
+            if engine is None or not engine.results:
+                messagebox.showerror(
+                    "No run selected",
+                    "Choose a calibration run with recorded results, or use a "
+                    "probe file instead.")
+                return
+            try:
+                probe_series = datasync.series_from_run(engine)
+            except Exception as e:
+                messagebox.showerror("Could not use that run", str(e))
+                return
+            if probe_series.empty:
+                messagebox.showerror(
+                    "That run has no reference readings",
+                    "The selected run recorded no samples on its reference "
+                    "channel.")
+                return
+        else:
+            probe_path = self.var_probe_path.get().strip()
+            if not probe_path:
+                messagebox.showerror("No reference",
+                                     "Choose a probe file, or use a "
+                                     "calibration run.")
+                return
+            if getattr(self, "_probe_needs_start", False):
+                text = self.var_start.get().strip()
+                if not text:
+                    messagebox.showerror(
+                        "Start time needed",
+                        "This probe file records elapsed time, so it needs a "
+                        "start date and time (YYYY-MM-DD HH:MM:SS).")
+                    return
+                try:
+                    start = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    messagebox.showerror(
+                        "Start time not understood",
+                        "Use the format YYYY-MM-DD HH:MM:SS, for example "
+                        "2026-05-21 22:58:35.")
+                    return
+
+        output = filedialog.asksaveasfilename(
+            title="Save the chart", defaultextension=".html",
+            initialfile="logger_comparison.html",
+            filetypes=[("Web page", "*.html")])
+        if not output:
+            return
+
+        self.lbl_compare.configure(text="Building…")
+
+        def work():
+            ok = self._compare_worker(probe_series, probe_path, start, output)
+            self.after(0, lambda: self.lbl_compare.configure(
+                text=f"Saved to {os.path.basename(output)}" if ok
+                else "Could not build the chart — see Activity."))
+            if ok:
+                self.after(0, lambda: messagebox.showinfo(
+                    "Chart ready", f"Saved:\n{output}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _compare_worker(self, probe_series, probe_path, start, output):
+        log = lambda message: self._log("INFO", message)
+        try:
+            if probe_series is None:
+                probe_series = datasync.load_any(probe_path, start=start,
+                                                 log_fn=log)
+            frames, names = [], []
+            for entry in self.logger_files.values():
+                name = os.path.splitext(os.path.basename(entry["path"]))[0]
+                log(f"Loading {name}")
+                frames.append(datasync.load_any(
+                    entry["path"], start=start, value_col=entry["value"],
+                    time_col=entry["time"], log_fn=log))
+                names.append(name)
+            if probe_series is not None and not probe_series.empty:
+                first = probe_series["_abs_time"].min()
+                last = probe_series["_abs_time"].max()
+                log(f"Aligning to the reference window {first:%Y-%m-%d %H:%M:%S}"
+                    f" to {last:%Y-%m-%d %H:%M:%S}")
+                frames = [datasync.clip_to_window(f, n, first, last, log)
+                          for f, n in zip(frames, names)]
+                for frame, name in zip(frames, names):
+                    if frame.empty:
+                        self._log("WARN", f"{name} does not overlap the "
+                                          "reference window at all.")
+            datasync.build_chart(probe_series, frames, names, output)
+            self._log("PASS", f"Chart written to {output}")
+            return True
+        except Exception as e:
+            self._log("FAIL", f"Logger comparison failed: {e}")
+            return False
+
     def _build_terminal_tab(self):
         t = ttk.Frame(self.nb)
-        self.nb.add(t, text=" 5 · Terminal ")
+        self.nb.add(t, text=" 6 · Terminal ")
         _h = ttk.Frame(t)
         _h.pack(fill="x", padx=18, pady=(18, 10))
         ttk.Label(_h, text="Terminal", style="Title.TLabel").pack(anchor="w")

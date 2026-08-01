@@ -1,4 +1,4 @@
-# Temperature Calibration Suite
+# Datum — Calibration Suite
 
 Automated multi-point temperature calibration. Your PC drives the heat
 sources, an Additel ADT286 does the measuring, and **several calibrations can
@@ -42,11 +42,14 @@ finishes you get a table, a graph, and two CSV files.
 
 ## Install and start
 
-Put all ten files in one folder, install pyserial once, then
+Put all eleven files in one folder, install pyserial once, then
 **double-click `Calibration Suite.pyw`**.
 
 ```
 pip install pyserial
+
+# only for the logger comparison tool:
+pip install pandas plotly openpyxl
 ```
 
 ```
@@ -55,6 +58,7 @@ your-folder/
     run_calibration_suite.py    <- same app, from a command prompt
     ui.py        theme.py       engine.py     adt286.py
     heatsource.py               transport.py  formats.py    export.py
+    datasync.py
 ```
 
 The `.pyw` extension tells Windows to run it with `pythonw.exe`, so the window
@@ -73,6 +77,31 @@ Two files are created next to the launcher and grow as you work:
 |---|---|
 | `heat_source_profiles.json` | each heat source: connection, range, command set, unit |
 | `calibration_profiles.json` | each calibration: channels, set points, stability and sampling settings |
+
+## Logger comparison
+
+A second tool in the suite: plot data loggers against a reference probe on one
+time axis, to see how each device tracked during a soak.
+
+It reads almost any logger export (CSV, TXT, XLSX) with no per-brand setup.
+Rather than matching known column names, it analyses the data — the timestamp
+column is whichever one actually parses as dates or elapsed time, and the
+temperature column is scored on both its name and whether its values sit in a
+plausible °C range, so humidity, pressure and resistance columns are rejected.
+Metadata preambles and summary blocks above the real header are skipped
+automatically. Every guess is shown and can be overridden.
+
+**The reference can be a calibration run from this application**, which skips
+an export-and-reimport round trip and guarantees the comparison is against the
+same readings the results were built from. A probe file works too; if it
+records elapsed time, you will be asked for the start time.
+
+Loggers are trimmed to the reference's time window, and anything that does not
+overlap it is called out rather than silently plotted. Output is a
+self-contained interactive HTML chart.
+
+Needs `pandas`, `plotly` and `openpyxl`. Without them this page explains what
+to install and the rest of the application works normally.
 
 ## The interface
 
@@ -321,7 +350,7 @@ nameplate, since the software refuses set points outside the range you set.
 
 | Symptom | Cause and fix |
 |---|---|
-| "No module named calsuite" | A file is missing or misplaced. Put all ten files in one folder; the launcher names anything absent in a dialog. |
+| "No module named calsuite" | A file is missing or misplaced. Put all eleven files in one folder; the launcher names anything absent in a dialog. |
 | A console window sits behind the app | Start `Calibration Suite.pyw`. If one still appears, Windows may be opening `.pyw` files with `python.exe`: right-click the file, Open with, and choose `pythonw.exe`. The `.py` launcher also hides its own console and, failing that, restarts itself windowless. Set `CALSUITE_KEEP_CONSOLE=1` to keep the console for debugging. |
 | Readings stop mid-run | The 286's display was changed, cancelling the scan. It recovers automatically within a few seconds — watch the scan health indicator. |
 | Every set point times out, but the bath looks steady | The stability window is too short for the scan rate. Use at least three read intervals, or scan faster. |
