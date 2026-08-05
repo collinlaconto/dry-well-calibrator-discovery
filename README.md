@@ -9,6 +9,12 @@ a run of samples from the reference and every device under test, records mean,
 standard deviation and error, then moves to the next point. When the run
 finishes you get a table, a graph, and two CSV files.
 
+Calibration evidence follows a device-only policy: temperature values, units,
+scan cycles, timestamps and device identities come from the connected
+instruments and are retained without offsets, smoothing, interpolation or unit
+conversion. Mean, sample standard deviation, error and verdict are calculated
+separately and are always labelled as derived results.
+
 ---
 
 ## Contents
@@ -84,23 +90,25 @@ A second tool in the suite: plot data loggers against a reference probe on one
 time axis, to see how each device tracked during a soak.
 
 It reads almost any logger export (CSV, TXT, XLSX) with no per-brand setup.
-Rather than matching known column names, it analyses the data — the timestamp
-column is whichever one actually parses as dates or elapsed time, and the
-temperature column is scored on both its name and whether its values sit in a
-plausible °C range, so humidity, pressure and resistance columns are rejected.
-Metadata preambles and summary blocks above the real header are skipped
-automatically. Every guess is shown and can be overridden.
+Rather than matching one brand's exact headings, it analyses which column
+parses as timestamps or elapsed time and scores temperature columns by their
+headings and data shape. Metadata preambles and summary blocks above the real
+header are skipped automatically. Every selection is shown and can be
+overridden.
 
-**Units are handled.** Each file's unit is read from its column heading, or
-guessed from the values when the heading is silent, and everything is
-converted to °C before charting — a °F logger drawn against a °C reference
-would otherwise look plausible and be wrong by tens of degrees. The detected
-unit is shown per file and can be overridden.
+**Units are explicit.** A unit is accepted from a column heading or from the
+operator's unit selection. Numeric magnitude is never used to guess a unit: an
+unlabelled value of 100 could be 100 °C or 100 °F. Files with no trustworthy
+unit stop for confirmation. When a comparison display uses °C, conversion is
+performed on a copy for the chart; the imported source values and units remain
+unchanged.
 
 **The reference can be a calibration run from this application**, which skips
 an export-and-reimport round trip and guarantees the comparison is against the
 same readings the results were built from. A probe file works too; if it
-records elapsed time, you will be asked for the start time.
+records elapsed time, you will be asked for the start time. Run-derived traces
+use each selected channel's ADT286 acquisition timestamp, never the PC receipt
+time, so transport delay cannot shift a reference or DUT trace.
 
 Loggers are trimmed to the reference's time window, and anything that does not
 overlap it is called out rather than silently plotted. A reference alone, or
@@ -113,12 +121,13 @@ to install and the rest of the application works normally.
 
 ## The interface
 
-A dark instrument console with softly rounded panels. A sidebar holds the
-tools; the temperature calibrator is the first of them. Measured values are set in a fixed-width
-face with tabular figures so decimal points line up down a column, the way
-instrument front panels do. Colour carries meaning and nothing else: cyan for
-the reference, amber for a measured value or a wait, green for in tolerance,
-red for out of tolerance.
+A light, compact calibration workspace uses a slim navy navigation rail and
+clear workflow groups, inspired by the structure of commercial calibration
+systems while retaining its own visual identity. The primary path—Instruments,
+Profiles, Runs and Results—appears first; comparison and service tools sit under
+Advanced. Device evidence and derived calculations are visibly separated.
+Measured values use tabular figures so decimal points line up, with green for
+in tolerance, red for out of tolerance and amber for waiting or invalid data.
 
 The **Runs** page puts the calibration you are watching at the top, at a size
 readable from across the bench:
@@ -228,6 +237,7 @@ On the **Profiles** tab:
 | Set points | in the order they run, e.g. `0, 50, 100, 50, 0` | — |
 | Stability band | peak-to-peak the reference may move | 0.02 |
 | Window it must hold | how long it must stay that flat | 60 s |
+| Set-point tolerance | how close the reference must be to the requested point | ±1.0 |
 | Give up after | maximum wait for one point | 2400 s |
 | Soak after stable | extra dwell before sampling | 0 s |
 | Samples per set point | readings taken at each point | 10 |
@@ -274,11 +284,14 @@ allows.
 
 The software watches the **reference probe** through the 286 — not the well's
 internal sensor. A point is stable once it has been watched for at least the
-window *and* the most recent window of readings is flat within the band.
+window, the most recent window of readings is flat within the band, and its
+mean is within the required set-point tolerance. A flat reference at the wrong
+temperature can never receive a valid verdict.
 
 A point that never stabilises is, by default, sampled anyway and marked
-**NOT STABLE** in the table and `NO` in the CSV, so a long run isn't lost but
-bad data can't pass as good. Choose `abort` if you'd rather the run stop.
+**NOT VALID** in the table and CSV. Its device readings are preserved for
+traceability, but neither the point nor the overall run can receive PASS.
+Choose `abort` if you'd rather the run stop immediately.
 
 ### Using the 286 by hand during a run
 
@@ -294,9 +307,11 @@ that something was interrupted.
 
 ### Scan rate and stability windows
 
-**Read channels every** on the Instruments tab (0.5 / 1 / 2 / 5 / 10 s) sets
-how often the 286 is scanned. Slower polling leaves the instrument freer for
-hands-on use.
+**Read channels every** on the Instruments tab (1 / 2 / 5 / 10 s) sets how
+often the 286 is queried. The application never requests readings faster than
+the device's configured one-second scan. It requests the ADT286's own
+millisecond acquisition timestamp with every frame; a missing or repeated
+device timestamp is withheld rather than assigned a new software sample.
 
 There's a coupling worth knowing: stability needs **at least three readings
 inside the window**, so a window shorter than three read intervals can never
@@ -308,23 +323,44 @@ faster than the scan.
 
 ## Results and export
 
-The **Results** tab shows a row per set point per DUT channel — reference mean
-and standard deviation, DUT mean and standard deviation, error, sample count,
-and whether the point was stable — plus a graph of error against set point per
-channel with a zero line.
+The **Results** tab has two explicit views:
+
+- **Device readings — immutable**: the exact numeric tokens and acquisition
+  timestamps returned by the ADT286, host receipt time, device scan cycle,
+  source command and phase.
+- **Derived summary**: reference and DUT mean, sample standard deviation,
+  error, tolerance, sample count, stability state and verdict, plus an error
+  graph. One observation has no standard deviation; it is left blank rather
+  than reported as zero.
 
 **Export CSV** writes two files into a folder you choose:
 
-- `«run»_«timestamp»_summary.csv` — the calibration table
-- `«run»_«timestamp»_samples.csv` — every individual reading
+- `«run»_«timestamp»_summary.csv` — derived statistics, tolerance and verdict
+- `«run»_«timestamp»_samples.csv` — unrounded device readings and stability
+  evidence, with fractional-second timestamps and scan cycles
 
-Both begin with full metadata: instrument identities, connections, ranges,
-channel assignments, set points, and the stability and sampling settings used.
+Both begin with the identities, connections, units, ranges, channel
+assignments and acquisition settings pinned when the run started. Exporting
+after reconnecting another device cannot relabel an earlier run. Existing
+filenames are never overwritten, and a run cannot be exported while its worker
+is still changing the evidence set. A validated profile, every completed point
+and all nested sample evidence are sealed read-only; the two CSVs are staged
+and published as one export operation, with rollback if either file fails.
+
+The heat source's set-point command, exact readback text and live reported unit
+are also retained. They are checked after the command, around every sample and
+after sampling. The unit token attached to the set-point reply and the separate
+live unit query are recorded in distinct fields with query/validation status;
+a conflict, unknown token or failed query invalidates the point without
+relabeling it. That failed device evidence is still sealed and exported even
+when the failure occurs before the first ADT286 sample.
 
 ## Terminal
 
 For hands-on work with any connected instrument, over whichever connection it
-uses.
+uses. It is query-only by default. Device-changing writes require an explicit
+Service mode and are blocked while that device belongs to an active
+calibration.
 
 - **Read set point / Read temperature / Read unit** send whichever command
   *that* instrument uses, taken from its own profile — so they work on an
@@ -392,7 +428,7 @@ configured type so you can confirm assignments.
 ## Accuracy of the built-in command sets
 
 - **ADT286** — from Additel's published command set (`MODule:INFormation?`,
-  `MODule:CONFig?`, `SCAN:MULT:STARt`, `SCAN:DATA:Last?`, `SCAN:STOP`,
+  `MODule:CONFig?`, `SCAN:MULT:STARt`, `SCAN:DATA:Last? 1`, `SCAN:STOP`,
   `UNIT:TEMPerature?`). The scan-data parser is tested against Additel's own
   worked example and tolerates the longer thermocouple form with cold-junction
   fields appended.

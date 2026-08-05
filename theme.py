@@ -18,24 +18,25 @@ from tkinter import font as tkfont
 from tkinter import ttk
 
 # --------------------------------------------------------------- palette --
-INK = "#e6ecf7"        # text
-DIM = "#8e9cba"        # secondary text
-LINE = "#2b3550"       # borders and rules
-PANEL = "#1b2338"      # cards
-SHELL = "#141a2b"      # window background
-NAV = "#101524"        # sidebar
-NAV_TEXT = "#a8b6d2"
-NAV_RULE = "#232c45"
-BLUE = "#5a8fd6"       # actions
-CYAN = "#54cfd0"       # the reference probe
-GREEN = "#5fbf8f"      # in tolerance, connected
-AMBER = "#f0a63c"      # measured value, waiting
-RED = "#e2695f"        # out of tolerance, stop
-TRACK = "#131a2c"      # inset wells behind bars
-TOL_FILL = "#1d3348"   # tolerance envelope
-TOL_EDGE = "#2f4f63"
-HILITE = "#232d47"
-SELECT = "#2b3a5c"
+INK = "#1f2937"        # primary text
+DIM = "#64748b"        # secondary text
+LINE = "#cfd8e5"       # borders and rules
+PANEL = "#ffffff"      # cards and tables
+SHELL = "#f4f7fb"      # workspace background
+NAV = "#123a61"        # module rail
+NAV_TEXT = "#d8e4ef"
+NAV_RULE = "#315879"
+NAV_ACTIVE = "#1d5688"
+BLUE = "#1f6fb2"       # actions
+CYAN = "#087f8c"       # the reference probe
+GREEN = "#1f7a48"      # in tolerance, connected
+AMBER = "#a25a00"      # measured value, waiting
+RED = "#b42318"        # out of tolerance, stop
+TRACK = "#edf2f7"      # inset wells behind bars
+TOL_FILL = "#dceef4"   # tolerance envelope
+TOL_EDGE = "#8bbdca"
+HILITE = "#e8eef6"
+SELECT = "#dcecff"
 
 _MONO_CHOICES = ("Consolas", "SF Mono", "Menlo", "DejaVu Sans Mono",
                  "Liberation Mono", "Courier New")
@@ -61,11 +62,11 @@ def apply(root):
     mono = _pick(root, _MONO_CHOICES, "TkFixedFont")
 
     FONTS.update({
-        "ui": (ui, 10),
-        "ui_bold": (ui, 10, "bold"),
+        "ui": (ui, 9),
+        "ui_bold": (ui, 9, "bold"),
         "small": (ui, 9),
         "label": (ui, 8),          # uppercase micro-labels
-        "title": (ui, 15, "bold"),
+        "title": (ui, 16, "bold"),
         "heading": (ui, 11, "bold"),
         "mono": (mono, 10),
         "mono_small": (mono, 9),
@@ -114,40 +115,52 @@ def apply(root):
                     font=FONTS["small"])
     style.configure("Bad.TLabel", background=PANEL, foreground=RED,
                     font=FONTS["small"])
+    style.configure("DeviceBadge.TLabel", background="#dceef4",
+                    foreground="#075f6a", font=FONTS["ui_bold"],
+                    padding=(7, 3))
+    style.configure("DerivedBadge.TLabel", background="#e7edf6",
+                    foreground="#334e73", font=FONTS["ui_bold"],
+                    padding=(7, 3))
+    style.configure("Pass.TLabel", background="#dff3e7", foreground=GREEN,
+                    font=FONTS["ui_bold"], padding=(10, 5))
+    style.configure("Fail.TLabel", background="#fde7e5", foreground=RED,
+                    font=FONTS["ui_bold"], padding=(10, 5))
+    style.configure("Invalid.TLabel", background="#fff1dc", foreground=AMBER,
+                    font=FONTS["ui_bold"], padding=(10, 5))
 
     style.configure("TLabelframe", background=SHELL, bordercolor=LINE,
                     relief="solid", borderwidth=1)
     style.configure("TLabelframe.Label", background=SHELL, foreground=DIM,
                     font=FONTS["label"])
 
-    style.configure("TButton", background=HILITE, foreground=INK,
+    style.configure("TButton", background=PANEL, foreground=INK,
                     bordercolor=LINE, relief="solid", borderwidth=1,
                     padding=(11, 6), font=FONTS["ui"])
     style.map("TButton",
-              background=[("pressed", "#1a2338"), ("active", "#2c3959"),
-                          ("disabled", "#1a2133")],
-              foreground=[("disabled", "#5d6884")],
-              bordercolor=[("active", "#42527a")])
-    style.configure("Primary.TButton", background="#2f6fbf", foreground="#ffffff",
-                    bordercolor="#2f6fbf", font=FONTS["ui_bold"])
+              background=[("pressed", "#dbe5f0"), ("active", HILITE),
+                          ("disabled", "#eef2f6")],
+              foreground=[("disabled", "#94a3b8")],
+              bordercolor=[("active", "#8aa4bf")])
+    style.configure("Primary.TButton", background=BLUE, foreground="#ffffff",
+                    bordercolor=BLUE, font=FONTS["ui_bold"])
     style.map("Primary.TButton",
-              background=[("pressed", "#255ca0"), ("active", "#3a80d2"),
-                          ("disabled", "#2b3a55")],
-              foreground=[("disabled", "#7d8aa6")],
-              bordercolor=[("active", "#3a80d2")])
-    style.configure("Danger.TButton", background="#3a2029", foreground="#ffb9b1",
-                    bordercolor="#5d2f37")
+              background=[("pressed", "#15598f"), ("active", "#2f80bd"),
+                          ("disabled", "#b7c7d8")],
+              foreground=[("disabled", "#eef3f8")],
+              bordercolor=[("active", "#2f80bd")])
+    style.configure("Danger.TButton", background="#fff5f4", foreground=RED,
+                    bordercolor="#e7aaa5")
     style.map("Danger.TButton",
-              background=[("active", "#4a2731")],
-              bordercolor=[("active", "#7a3d47")])
+              background=[("active", "#fde7e5")],
+              bordercolor=[("active", RED)])
 
     style.configure("TEntry", fieldbackground=TRACK, bordercolor=LINE,
                     lightcolor=LINE, darkcolor=LINE, relief="solid",
                     borderwidth=1, padding=4, foreground=INK,
                     insertcolor=INK)
     style.map("TEntry", bordercolor=[("focus", CYAN)],
-              fieldbackground=[("disabled", "#1a2133")],
-              foreground=[("disabled", "#5d6884")])
+              fieldbackground=[("disabled", "#eef2f6")],
+              foreground=[("disabled", "#94a3b8")])
     style.configure("TCombobox", fieldbackground=TRACK, background=HILITE,
                     bordercolor=LINE, lightcolor=LINE, darkcolor=LINE,
                     arrowcolor=DIM, relief="solid", borderwidth=1, padding=3,
@@ -155,25 +168,42 @@ def apply(root):
                     selectforeground=INK)
     style.map("TCombobox", bordercolor=[("focus", CYAN)],
               fieldbackground=[("readonly", TRACK)],
-              foreground=[("disabled", "#5d6884")])
+              foreground=[("disabled", "#94a3b8")])
     root.option_add("*TCombobox*Listbox.background", PANEL)
     root.option_add("*TCombobox*Listbox.foreground", INK)
     root.option_add("*TCombobox*Listbox.selectBackground", SELECT)
     root.option_add("*TCombobox*Listbox.selectForeground", INK)
+    root.option_add("*Listbox.background", PANEL)
+    root.option_add("*Listbox.foreground", INK)
+    root.option_add("*Listbox.selectBackground", SELECT)
+    root.option_add("*Listbox.selectForeground", INK)
+    root.option_add("*Listbox.highlightBackground", LINE)
+    root.option_add("*Listbox.highlightColor", BLUE)
+    root.option_add("*Listbox.borderWidth", 1)
+    root.option_add("*Text.background", PANEL)
+    root.option_add("*Text.foreground", INK)
+    root.option_add("*Text.insertBackground", INK)
     style.configure("TCheckbutton", background=SHELL, foreground=INK,
                     indicatorcolor=TRACK, indicatorbackground=TRACK,
                     focuscolor=CYAN)
     style.map("TCheckbutton", background=[("active", SHELL)],
               indicatorcolor=[("selected", CYAN)],
-              foreground=[("disabled", "#5d6884")])
+              foreground=[("disabled", "#94a3b8")])
 
     style.configure("Treeview", background=PANEL, fieldbackground=PANEL,
                     foreground=INK, bordercolor=LINE, relief="solid",
                     borderwidth=1, rowheight=23, font=FONTS["mono_small"])
-    style.configure("Treeview.Heading", background=SHELL, foreground=DIM,
-                    font=FONTS["label"], relief="flat", padding=(6, 5))
+    style.configure("Treeview.Heading", background="#e9eef5",
+                    foreground="#42566f", font=FONTS["ui_bold"],
+                    relief="flat", padding=(6, 6))
     style.map("Treeview.Heading", background=[("active", HILITE)])
     style.map("Treeview", background=[("selected", SELECT)],
+              foreground=[("selected", INK)])
+    style.configure("TNotebook", background=SHELL, borderwidth=0)
+    style.configure("TNotebook.Tab", background="#e9eef5", foreground=DIM,
+                    padding=(12, 6), font=FONTS["ui"])
+    style.map("TNotebook.Tab", background=[("selected", PANEL),
+                                           ("active", HILITE)],
               foreground=[("selected", INK)])
 
     style.configure("TProgressbar", background=BLUE, troughcolor=TRACK,
@@ -188,7 +218,7 @@ def apply(root):
 
 
 # ------------------------------------------------------------- widgets ----
-RADIUS = 10
+RADIUS = 4
 
 
 def round_rect(canvas, x1, y1, x2, y2, radius=RADIUS, **kw):
@@ -243,9 +273,9 @@ class Button(tk.Canvas):
     """A rounded button, since ttk buttons are square in every theme."""
 
     VARIANTS = {
-        "": (HILITE, INK, LINE, "#2c3959"),
-        "Primary.TButton": ("#2f6fbf", "#ffffff", "#2f6fbf", "#3a80d2"),
-        "Danger.TButton": ("#3a2029", "#ffb9b1", "#5d2f37", "#4a2731"),
+        "": (PANEL, INK, LINE, HILITE),
+        "Primary.TButton": (BLUE, "#ffffff", BLUE, "#2f80bd"),
+        "Danger.TButton": ("#fff5f4", RED, "#e7aaa5", "#fde7e5"),
     }
 
     def __init__(self, master, text="", command=None, style="",
@@ -256,12 +286,13 @@ class Button(tk.Canvas):
         self.padx, self.pady = padx, pady
         self._enabled = True
         self._state = "normal"
+        self._focused = False
         font = FONTS.get("ui_bold" if style == "Primary.TButton" else "ui",
                          ("", 10))
         width, height = self._measure(master, text, font)
         super().__init__(master, width=width, height=height,
                          background=outside, highlightthickness=0, bd=0,
-                         cursor="hand2", **kw)
+                         cursor="hand2", takefocus=1, **kw)
         self._font = font
         self._draw()
         self.bind("<Button-1>", self._press)
@@ -269,6 +300,10 @@ class Button(tk.Canvas):
         self.bind("<Enter>", lambda e: self._set("hover"))
         self.bind("<Leave>", lambda e: self._set("normal"))
         self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<Return>", self._keyboard_activate)
+        self.bind("<space>", self._keyboard_activate)
+        self.bind("<FocusIn>", lambda e: self._focus(True))
+        self.bind("<FocusOut>", lambda e: self._focus(False))
 
     def _measure(self, master, text, font):
         try:
@@ -288,7 +323,7 @@ class Button(tk.Canvas):
         w = max(int(self.cget("width")), 10)
         h = max(int(self.cget("height")), 10)
         if not self._enabled:
-            fill, fg, edge = "#1a2133", "#5d6884", "#232c45"
+            fill, fg, edge = "#eef2f6", "#94a3b8", "#d9e0e8"
         elif self._state == "hover":
             fill, fg, edge = self.hover, self.fg, self.edge
         elif self._state == "press":
@@ -296,7 +331,8 @@ class Button(tk.Canvas):
         else:
             fill, fg, edge = self.fill, self.fg, self.edge
         round_rect(self, 1, 1, w - 1, h - 1, self.radius, fill=fill,
-                   outline=edge)
+                   outline=BLUE if self._focused else edge,
+                   width=2 if self._focused else 1)
         self.create_text(w / 2, h / 2, text=self.text, fill=fg,
                          font=self._font)
 
@@ -309,6 +345,15 @@ class Button(tk.Canvas):
         self._set("hover")
         if self.command:
             self.command()
+
+    def _keyboard_activate(self, _event=None):
+        if self._enabled and self.command:
+            self.command()
+        return "break"
+
+    def _focus(self, focused):
+        self._focused = focused
+        self._draw()
 
     def configure(self, **kw):
         if "state" in kw:
@@ -341,18 +386,18 @@ class PageStack(ttk.Frame):
         self.tabs = []                    # labels, for tests and debugging
         self._current = None
 
-        self.nav = tk.Frame(self, background=NAV, width=196)
+        self.nav = tk.Frame(self, background=NAV, width=218)
         self.nav.pack(side="left", fill="y")
         self.nav.pack_propagate(False)
 
         brand = tk.Frame(self.nav, background=NAV)
-        brand.pack(fill="x", padx=16, pady=(18, 16))
-        tk.Label(brand, text=title, background=NAV, foreground="#dfe7f7",
+        brand.pack(fill="x", padx=18, pady=(18, 16))
+        tk.Label(brand, text=title, background=NAV, foreground="#ffffff",
                  font=FONTS.get("heading", ("", 11, "bold")),
                  anchor="w").pack(fill="x")
         if subtitle:
             tk.Label(brand, text=subtitle.upper(), background=NAV,
-                     foreground="#5f6d8c", font=FONTS.get("label", ("", 8)),
+                     foreground="#9fbbd2", font=FONTS.get("label", ("", 8)),
                      anchor="w").pack(fill="x")
         tk.Frame(self.nav, background=NAV_RULE, height=1).pack(fill="x")
 
@@ -360,10 +405,10 @@ class PageStack(ttk.Frame):
         self.body.pack(side="left", fill="both", expand=True)
 
         self.status = tk.Label(self.nav, text="", background=NAV,
-                               foreground="#5f6d8c", anchor="w",
-                               justify="left", wraplength=164,
+                               foreground="#b7cada", anchor="w",
+                               justify="left", wraplength=182,
                                font=FONTS.get("small", ("", 9)))
-        self.status.pack(side="bottom", fill="x", padx=16, pady=12)
+        self.status.pack(side="bottom", fill="x", padx=18, pady=14)
 
     # -- Notebook-compatible surface --------------------------------------
     def add(self, child, text=""):
@@ -372,7 +417,7 @@ class PageStack(ttk.Frame):
         group = self.groups.get(index)
         if group:
             tk.Label(self.nav, text=group.upper(), background=NAV,
-                     foreground="#5f6d8c", anchor="w",
+                      foreground="#9fbbd2", anchor="w",
                      font=FONTS.get("label", ("", 8))
                      ).pack(fill="x", padx=16, pady=(14, 3))
         btn = tk.Label(self.nav, text=label, background=NAV,
@@ -402,7 +447,7 @@ class PageStack(ttk.Frame):
         self.pages[index].lift()
         for i, btn in enumerate(self.buttons):
             on = (i == index)
-            btn.configure(background=PANEL if on else NAV,
+            btn.configure(background=NAV_ACTIVE if on else NAV,
                           foreground="#ffffff" if on else NAV_TEXT,
                           font=FONTS.get("ui_bold" if on else "ui",
                                          ("", 10)))
@@ -413,9 +458,9 @@ class PageStack(ttk.Frame):
         self.status.configure(text=text)
 
     def _hover(self, btn, entering):
-        if btn.cget("background") == PANEL:
+        if btn.cget("background") == NAV_ACTIVE:
             return
-        btn.configure(background="#1a2133" if entering else NAV)
+        btn.configure(background="#194a76" if entering else NAV)
 
     @staticmethod
     def _clean(text):
@@ -469,12 +514,6 @@ class Chip(tk.Canvas):
         self.create_oval(11, cy - 3.5, 18, cy + 3.5, fill=colour, outline="")
         self.create_text(24, cy, anchor="w", text=self._text, fill=INK,
                          font=FONTS.get("small", ("", 9)))
-
-    def set(self, text, state="ok"):
-        colour = {"ok": GREEN, "warn": AMBER, "bad": RED, "idle": "#5d6884"}
-        self.dot.itemconfigure(self._mark, fill=colour.get(state, DIM))
-        self.label.configure(text=text)
-
 
 class DeviationBand(tk.Canvas):
     """Error against the reference, drawn inside a tolerance envelope.

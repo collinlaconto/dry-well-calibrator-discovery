@@ -262,6 +262,56 @@ def describe_unit_token(token):
     return token
 
 
+def unit_name_for_token(token):
+    """Canonical display unit for a reported numeric/name unit token."""
+    value = (token or "").strip()
+    if value in UNIT_ID_NAMES:
+        return UNIT_ID_NAMES[value]
+    key = value.upper().replace("DEG", "").replace("°", "")
+    return {"C": "°C", "CEL": "°C", "CELSIUS": "°C",
+            "F": "°F", "FAR": "°F", "FAH": "°F",
+            "FAHRENHEIT": "°F",
+            "K": "K", "KELVIN": "K",
+            "R": "°R", "RANKINE": "°R"}.get(key, "")
+
+
+def unit_token_from_reply(reply):
+    """Exact recognised token supplied by a dedicated device unit reply."""
+    text = str(reply or "").strip().strip('"')
+    if not text:
+        return ""
+    tokens = [token.strip().strip('"') for token in
+              re.split(r"[\s,:=;]+", text) if token.strip()]
+    recognised = [
+        (token, unit_name_for_token(token)) for token in tokens
+        if unit_name_for_token(token)
+    ]
+    if len({unit for _token, unit in recognised}) > 1:
+        return ""
+    # When a reply provides both a name and Additel's numeric unit id, the
+    # numeric id is the exact token the device's value commands expect, but
+    # only when every recognised field declares the same physical unit.
+    for token, _unit in recognised:
+        if token in UNIT_ID_NAMES:
+            return token
+    if unit_name_for_token(text):
+        return text
+    if recognised:
+        return recognised[0][0]
+    return ""
+
+
+def unit_name_from_reply(reply):
+    """Canonical temperature unit from a dedicated device-unit reply.
+
+    Unit queries vary between numeric Additel IDs, SCPI abbreviations such as
+    ``CEL`` and terse classic-controller replies such as ``u: C``.  Only
+    explicit, recognised unit tokens are accepted; numeric magnitude is never
+    used as evidence of a unit.
+    """
+    return unit_name_for_token(unit_token_from_reply(reply))
+
+
 def first_float(text):
     """First numeric value in a reply, or None."""
     if not text:

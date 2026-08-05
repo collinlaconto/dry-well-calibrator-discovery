@@ -1,8 +1,10 @@
 """Tkinter interface for the calibration suite."""
 
 import json
+import math
 import os
 import queue
+import tempfile
 import threading
 import time
 from collections import deque
@@ -92,7 +94,7 @@ class ConnectionPicker(ttk.Frame):
                   width=8).pack(side="left")
         theme.Button(self.row_tcp, text="Find port",
                    command=self.find_port).pack(side="left", padx=8)
-        self.lbl_hint = ttk.Label(self, text="", foreground="#555",
+        self.lbl_hint = ttk.Label(self, text="", style="Dim.TLabel",
                                   wraplength=620, justify="left")
         self.lbl_hint.grid(row=3, column=0, columnspan=6, sticky="w", padx=6)
         self.refresh_ports()
@@ -308,8 +310,8 @@ class SuiteApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1240x840")
-        self.minsize(1040, 720)
+        self.geometry("1280x860")
+        self.minsize(1100, 740)
         self.fonts = theme.apply(self)
 
         self.adt = Adt286(logger=self._instrument_log)
@@ -322,6 +324,7 @@ class SuiteApp(tk.Tk):
         self.events = queue.Queue()
         self.log_queue = queue.Queue()
         self._run_seq = 0
+        self.history_cycles = {}
 
         self._build_ui()
         self._refresh_ports()
@@ -348,11 +351,25 @@ class SuiteApp(tk.Tk):
         return list(fallback)
 
     def _save(self, path, data):
+        temporary = None
         try:
-            with open(path, "w", encoding="utf-8") as f:
+            folder = os.path.dirname(path) or "."
+            fd, temporary = tempfile.mkstemp(prefix=".calsuite-", suffix=".tmp",
+                                             dir=folder, text=True)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, path)
+            temporary = None
         except Exception as e:
             messagebox.showerror("Saving failed", f"Could not write {path}:\n{e}")
+        finally:
+            if temporary and os.path.exists(temporary):
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
 
     # ------------------------------------------------------------ logging --
     def _instrument_log(self, tag, message):
@@ -386,6 +403,11 @@ class SuiteApp(tk.Tk):
                       else "#9a6700" if "recovered" in health else "#444")
             self.lbl_scan.configure(text=f"286 scan: {health}",
                                     foreground=colour)
+            active = sum(1 for engine in self.engines.values()
+                         if engine.is_active)
+            self.nb.set_status(
+                "DATA POLICY\nDevice readings retained unadjusted\n\n"
+                f"ADT286\n{health}\n\nRUNS\n{active} active")
         except Exception:
             pass
         self.after(300, self._drain)
@@ -412,8 +434,8 @@ class SuiteApp(tk.Tk):
     # ----------------------------------------------------------------- UI --
     def _build_ui(self):
         self.nb = theme.PageStack(
-            self, title="Calibration Automation Suite",
-            groups={0: "Set up", 1: "Calibrate", 3: "Records", 5: "Tools"})
+            self, title="Calibration Suite", subtitle="Device data only",
+            groups={0: "Calibration workflow", 4: "Records", 5: "Advanced"})
         self.nb.pack(fill="both", expand=True)
         self._build_instruments_tab()
         self._build_profiles_tab()
@@ -422,6 +444,7 @@ class SuiteApp(tk.Tk):
         self._build_compare_tab()
         self._build_terminal_tab()
         self._build_activity_tab()
+        self.nb.set_status("DATA POLICY\nDevice readings are retained unadjusted")
 
 
     def _build_activity_tab(self):
@@ -480,18 +503,18 @@ class SuiteApp(tk.Tk):
         theme.Button(btns, text="Disconnect",
                    command=self._disconnect_adt).pack(side="left", padx=4)
         self.lbl_adt = ttk.Label(btns, text="Not connected",
-                                 foreground="#b00020")
+                                 foreground=theme.RED)
         self.lbl_adt.pack(side="left", padx=10)
         ttk.Label(btns, text="   Read channels every").pack(side="left")
         self.var_poll = tk.StringVar(value="1")
         ttk.Combobox(btns, textvariable=self.var_poll, width=5,
                      state="readonly",
-                     values=["0.5", "1", "2", "5", "10"]).pack(side="left",
+                     values=["1", "2", "5", "10"]).pack(side="left",
                                                                padx=4)
         ttk.Label(btns, text="s").pack(side="left")
         theme.Button(btns, text="Apply",
                    command=self._apply_poll).pack(side="left", padx=6)
-        ttk.Label(adt, foreground="#555", wraplength=980, justify="left",
+        ttk.Label(adt, style="Dim.TLabel", wraplength=980, justify="left",
                   text=("Channels are read as the 286 has them configured. "
                         "The suite never changes the 286's channel setup or "
                         "units, because those are global and other runs "
@@ -505,7 +528,7 @@ class SuiteApp(tk.Tk):
         self.lst_channels.grid(row=3, column=0, columnspan=3, sticky="w",
                                padx=8, pady=6)
         self.lbl_channel_use = ttk.Label(adt, text="", justify="left",
-                                         foreground="#444")
+                                         style="Dim.TLabel")
         self.lbl_channel_use.grid(row=3, column=3, columnspan=3, sticky="nw",
                                   padx=8, pady=6)
 
@@ -565,7 +588,7 @@ class SuiteApp(tk.Tk):
         form = ttk.Frame(t)
         form.pack(side="left", fill="both", expand=True, padx=18, pady=(0, 16))
 
-        basic = ttk.LabelFrame(form, text="What to calibrate")
+        basic = ttk.LabelFrame(form, text="1 · Devices and channels")
         basic.pack(fill="x", pady=4)
         self.var_p_name = tk.StringVar()
         self.var_p_source = tk.StringVar()
@@ -589,24 +612,24 @@ class SuiteApp(tk.Tk):
         self.lst_p_duts = tk.Listbox(basic, selectmode="multiple", height=7,
                                      width=34, exportselection=False)
         self.lst_p_duts.grid(row=3, column=1, sticky="w", **pad)
-        ttk.Label(basic, foreground="#555",
+        ttk.Label(basic, style="Dim.TLabel",
                   text="Ctrl-click to pick several. A channel can belong to "
                        "only one running calibration at a time.").grid(
             row=4, column=1, sticky="w", padx=6)
 
-        sp = ttk.LabelFrame(form, text="Set points")
+        sp = ttk.LabelFrame(form, text="2 · Test points")
         sp.pack(fill="x", pady=4)
         self.var_p_setpoints = tk.StringVar()
         ttk.Label(sp, text="Set points (°, comma separated)").grid(
             row=0, column=0, sticky="e", **pad)
         ttk.Entry(sp, textvariable=self.var_p_setpoints, width=52).grid(
             row=0, column=1, sticky="w", **pad)
-        ttk.Label(sp, foreground="#555",
+        ttk.Label(sp, style="Dim.TLabel",
                   text="They run in the order given — e.g. 0, 50, 100, 50, 0 "
                        "for an up-and-down sequence.").grid(
             row=1, column=1, sticky="w", padx=6)
 
-        tol = ttk.LabelFrame(form, text="Tolerance — how far a device may sit "
+        tol = ttk.LabelFrame(form, text="3 · Tolerance — how far a device may sit "
                                        "from the reference and still pass")
         tol.pack(fill="x", pady=4)
         self.var_tol_mode = tk.StringVar(value="single")
@@ -631,7 +654,7 @@ class SuiteApp(tk.Tk):
         theme.Button(tol, text="Fill from the single value",
                    command=self._fill_tolerances).grid(row=1, column=3, **pad)
 
-        stab = ttk.LabelFrame(form, text="Stability and sampling")
+        stab = ttk.LabelFrame(form, text="4 · Stability and sampling")
         stab.pack(fill="x", pady=4)
         self.var_p_band = tk.StringVar(value="0.02")
         self.var_p_window = tk.StringVar(value="60")
@@ -639,7 +662,7 @@ class SuiteApp(tk.Tk):
         self.var_p_count = tk.StringVar(value="10")
         self.var_p_interval = tk.StringVar(value="5")
         self.var_p_soak = tk.StringVar(value="0")
-        self.var_p_near = tk.BooleanVar(value=False)
+        self.var_p_near = tk.BooleanVar(value=True)
         self.var_p_sptol = tk.StringVar(value="1.0")
         self.var_p_enable = tk.BooleanVar(value=True)
         self.var_p_disable = tk.BooleanVar(value=True)
@@ -658,11 +681,10 @@ class SuiteApp(tk.Tk):
             ttk.Label(stab, text=label).grid(row=r, column=c, sticky="e", **pad)
             ttk.Entry(stab, textvariable=var, width=10).grid(
                 row=r, column=c + 1, sticky="w", **pad)
-        ttk.Checkbutton(stab, text="Also require the reference to be near the "
-                                   "set point",
-                        variable=self.var_p_near).grid(row=3, column=0,
-                                                       columnspan=2,
-                                                       sticky="w", **pad)
+        ttk.Checkbutton(stab, text="Require reference near set point (required)",
+                        variable=self.var_p_near, state="disabled").grid(
+                            row=3, column=0, columnspan=2,
+                            sticky="w", **pad)
         ttk.Checkbutton(stab, text="Enable heat source output at start",
                         variable=self.var_p_enable).grid(row=4, column=0,
                                                          columnspan=2,
@@ -682,11 +704,11 @@ class SuiteApp(tk.Tk):
                      values=["record", "abort"]).grid(row=5, column=3,
                                                       sticky="w", **pad)
 
-        act = ttk.Frame(form)
+        act = ttk.LabelFrame(form, text="5 · Review and start")
         act.pack(fill="x", pady=6)
         theme.Button(act, text="Check this profile",
                    command=self._validate_profile).pack(side="left")
-        theme.Button(act, text="Save and start run",
+        theme.Button(act, text="Save and start run", style="Primary.TButton",
                    command=self._save_and_start).pack(side="left", padx=8)
 
     # --- tab 3 -------------------------------------------------------------
@@ -771,11 +793,18 @@ class SuiteApp(tk.Tk):
         self.nb.add(t, text=" 4 · Results ")
         _h = ttk.Frame(t)
         _h.pack(fill="x", padx=18, pady=(18, 10))
-        ttk.Label(_h, text="Results", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(_h, text="Every point measured, with the error against the reference.", style="Dim.TLabel").pack(anchor="w",
-                                                             pady=(2, 0))
+        titles = ttk.Frame(_h)
+        titles.pack(side="left")
+        ttk.Label(titles, text="Results", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            titles,
+            text="Device evidence and calculated calibration results are kept separate.",
+            style="Dim.TLabel").pack(anchor="w", pady=(2, 0))
+        self.lbl_result_status = ttk.Label(_h, text="NO RUN SELECTED",
+                                           style="Invalid.TLabel")
+        self.lbl_result_status.pack(side="right", pady=(4, 0))
         bar = ttk.Frame(t)
-        bar.pack(fill="x", padx=8, pady=8)
+        bar.pack(fill="x", padx=18, pady=(0, 8))
         ttk.Label(bar, text="Run").pack(side="left")
         self.var_result_run = tk.StringVar()
         self.cbo_result_run = ttk.Combobox(bar, textvariable=self.var_result_run,
@@ -788,10 +817,32 @@ class SuiteApp(tk.Tk):
         theme.Button(bar, text="Export CSV",
                    command=self._export_csv).pack(side="left", padx=8)
 
+        provenance = ttk.Frame(t)
+        provenance.pack(fill="x", padx=18, pady=(0, 8))
+        ttk.Label(provenance, text="DEVICE",
+                  style="DeviceBadge.TLabel").pack(side="left")
+        ttk.Label(
+            provenance, style="Dim.TLabel",
+            text=" Exact ADT286 tokens, scan cycle and acquisition time are read-only. "
+        ).pack(side="left")
+        ttk.Label(provenance, text="DERIVED",
+                  style="DerivedBadge.TLabel").pack(side="left", padx=(10, 0))
+        ttk.Label(
+            provenance, style="Dim.TLabel",
+            text=" Mean, sample SD, error and verdict only."
+        ).pack(side="left")
+
+        self.result_views = ttk.Notebook(t)
+        self.result_views.pack(fill="both", expand=True, padx=18, pady=(0, 8))
+        derived = ttk.Frame(self.result_views)
+        raw = ttk.Frame(self.result_views)
+        self.result_views.add(derived, text="Derived summary")
+        self.result_views.add(raw, text="Device readings · immutable")
+
         cols = ("setpoint", "stable", "ref", "refsd", "channel", "mean", "sd",
                 "error", "tol", "verdict", "n")
-        self.tbl_results = ttk.Treeview(t, columns=cols, show="headings",
-                                        height=10)
+        self.tbl_results = ttk.Treeview(derived, columns=cols, show="headings",
+                                        height=8)
         for c, w, txt in (("setpoint", 90, "Set point"),
                           ("stable", 70, "Stable"),
                           ("ref", 120, "Reference"), ("refsd", 90, "Ref SD"),
@@ -802,10 +853,23 @@ class SuiteApp(tk.Tk):
                           ("n", 50, "n")):
             self.tbl_results.heading(c, text=txt)
             self.tbl_results.column(c, width=w, anchor="w")
-        self.tbl_results.pack(fill="both", expand=True, padx=8, pady=6)
+        self.tbl_results.pack(fill="both", expand=True)
         self.tbl_results.tag_configure("fail", foreground=theme.RED)
-        self.plot = PlotCanvas(t, height=300)
-        self.plot.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.tbl_results.tag_configure("invalid", foreground=theme.AMBER)
+
+        self.tbl_raw = ttk.Treeview(raw, columns=(), show="headings", height=8)
+        raw_y = ttk.Scrollbar(raw, orient="vertical", command=self.tbl_raw.yview)
+        raw_x = ttk.Scrollbar(raw, orient="horizontal", command=self.tbl_raw.xview)
+        self.tbl_raw.configure(yscrollcommand=raw_y.set,
+                               xscrollcommand=raw_x.set)
+        self.tbl_raw.grid(row=0, column=0, sticky="nsew")
+        raw_y.grid(row=0, column=1, sticky="ns")
+        raw_x.grid(row=1, column=0, sticky="ew")
+        raw.rowconfigure(0, weight=1)
+        raw.columnconfigure(0, weight=1)
+
+        self.plot = PlotCanvas(t, height=230)
+        self.plot.pack(fill="both", expand=True, padx=18, pady=(0, 12))
 
     # --- tab 5: terminal ---------------------------------------------------
     def _build_compare_tab(self):
@@ -863,6 +927,12 @@ class SuiteApp(tk.Tk):
         self.ent_probe.grid(row=1, column=1, sticky="w", **pad)
         theme.Button(ref, text="Choose…",
                      command=self._pick_probe).grid(row=1, column=2, **pad)
+        ttk.Label(ref, text="Unit").grid(row=1, column=3, sticky="e", **pad)
+        self.var_probe_unit = tk.StringVar()
+        self.cbo_probe_unit = ttk.Combobox(
+            ref, textvariable=self.var_probe_unit, width=8, state="readonly",
+            values=["", "°C", "°F", "K"])
+        self.cbo_probe_unit.grid(row=1, column=4, sticky="w", **pad)
         self.lbl_probe_cols = ttk.Label(ref, style="Dim.TLabel", text="")
         self.lbl_probe_cols.grid(row=2, column=0, columnspan=3, sticky="w",
                                  padx=6, pady=(0, 4))
@@ -924,10 +994,10 @@ class SuiteApp(tk.Tk):
                      command=self._apply_logger_columns).pack(side="left",
                                                               padx=8)
         ttk.Label(dev, style="Dim.TLabel", wraplength=880, justify="left",
-                  text="Columns and units are detected automatically; override "
-                       "them here if a file is unusual. Everything is converted "
-                       "to °C and trimmed to the reference's time window before "
-                       "charting."
+                  text="Columns are detected automatically. Units are read "
+                       "from headings or must be selected explicitly; they are "
+                       "never guessed from the values. Display copies are "
+                       "converted to °C for charting; source files are unchanged."
                   ).pack(anchor="w", padx=8, pady=(0, 6))
 
         # --- output --------------------------------------------------------
@@ -944,6 +1014,8 @@ class SuiteApp(tk.Tk):
         from_run = self.var_ref_source.get() == "run"
         self.cbo_cmp_run.configure(state="readonly" if from_run else "disabled")
         self.ent_probe.configure(state="disabled" if from_run else "normal")
+        self.cbo_probe_unit.configure(
+            state="disabled" if from_run else "readonly")
         if from_run:
             self._refresh_compare_runs()
 
@@ -951,8 +1023,11 @@ class SuiteApp(tk.Tk):
         labels = []
         for run_id, eng in self.engines.items():
             if eng.results:
+                unit = dict(getattr(eng, "evidence", {}) or {}).get(
+                    "readout_unit") or getattr(eng, "measurement_unit", "")
                 labels.append(f"{eng.profile.get('name', '')} ({run_id}) — "
-                              f"{datasync.sample_count(eng)} samples")
+                              f"{datasync.sample_count(eng)} samples · "
+                              f"{unit or 'unit not reported'}")
         self.cbo_cmp_run["values"] = labels
         if labels and self.var_cmp_run.get() not in labels:
             self.var_cmp_run.set(labels[-1])
@@ -977,6 +1052,8 @@ class SuiteApp(tk.Tk):
         self._probe_info = info
         self._probe_needs_start = info["needs_start"]
         unit = info.get("unit")
+        self.var_probe_unit.set(
+            {"C": "°C", "F": "°F", "K": "K"}.get(unit, ""))
         self.lbl_probe_cols.configure(
             text=f"Detected time '{info['time_guess']}', temperature "
                  f"'{info['value_guess']}', unit "
@@ -1021,15 +1098,15 @@ class SuiteApp(tk.Tk):
                                   "will be converted to °C before charting.")
             elif not unit:
                 self._log("WARN", f"{os.path.basename(path)}: no unit could be "
-                                  "determined; values will be treated as °C. "
-                                  "Set it in the Unit box if that is wrong.")
+                                  "read from the heading. Select a unit before "
+                                  "building the chart.")
 
     @staticmethod
     def _unit_text(unit, source):
         if not unit:
-            return "assumed °C"
+            return "not stated"
         label = {"C": "°C", "F": "°F", "K": "K"}.get(unit, unit)
-        return label if source == "name" else f"{label} (guess)"
+        return label
 
     def _selected_logger(self):
         sel = self.tbl_loggers.selection()
@@ -1070,9 +1147,6 @@ class SuiteApp(tk.Tk):
             column = entry["value"] or info.get("value_guess")
             shown_unit = datasync.unit_from_name(column) if column else None
             source = "name" if shown_unit else None
-            if shown_unit is None and column in info["df"].columns:
-                shown_unit = datasync.unit_from_values(info["df"][column])
-                source = "values" if shown_unit else None
         self.tbl_loggers.item(
             sel[0], values=(os.path.basename(entry["path"]),
                             entry["time"] or info["time_guess"],
@@ -1118,6 +1192,12 @@ class SuiteApp(tk.Tk):
             except Exception as e:
                 messagebox.showerror("Could not use that run", str(e))
                 return
+            source_unit = probe_series.attrs.get("source_unit")
+            if source_unit and source_unit != "C":
+                self._log(
+                    "INFO", f"Calibration-run comparison: pinned °{source_unit} "
+                    "device values are unchanged; a converted °C copy is used "
+                    "only for this chart.")
             if probe_series.empty:
                 messagebox.showerror(
                     "That run has no reference readings",
@@ -1126,6 +1206,12 @@ class SuiteApp(tk.Tk):
                 return
         elif not from_run:
             probe_path = self.var_probe_path.get().strip()
+            if probe_path and not self.var_probe_unit.get():
+                messagebox.showerror(
+                    "Reference unit needed",
+                    "The probe file does not state a temperature unit. Select "
+                    "°C, °F, or K; the suite will not guess from its values.")
+                return
             if probe_path and getattr(self, "_probe_needs_start", False):
                 if not self.var_start.get().strip():
                     messagebox.showerror(
@@ -1143,6 +1229,19 @@ class SuiteApp(tk.Tk):
                     "Start time not understood",
                     "Use the format YYYY-MM-DD HH:MM:SS, for example "
                     "2026-05-21 22:58:35.")
+                return
+
+        for entry in self.logger_files.values():
+            selected_column = (entry.get("value") or
+                               entry["info"].get("value_guess"))
+            effective_unit = (entry.get("unit") or
+                              datasync.unit_from_name(selected_column))
+            if not effective_unit:
+                messagebox.showerror(
+                    "Logger unit needed",
+                    f"{os.path.basename(entry['path'])} does not state a "
+                    "temperature unit. Select the file, choose °C, °F, or K, "
+                    "and apply it before building the chart.")
                 return
 
         output = filedialog.asksaveasfilename(
@@ -1168,8 +1267,10 @@ class SuiteApp(tk.Tk):
         log = lambda message: self._log("INFO", message)
         try:
             if probe_series is None and probe_path:
+                probe_unit = {"°C": "C", "°F": "F", "K": "K"}.get(
+                    self.var_probe_unit.get())
                 probe_series = datasync.load_any(probe_path, start=start,
-                                                 log_fn=log)
+                                                 unit=probe_unit, log_fn=log)
             frames, names = [], []
             for entry in self.logger_files.values():
                 name = os.path.splitext(os.path.basename(entry["path"]))[0]
@@ -1218,6 +1319,10 @@ class SuiteApp(tk.Tk):
         self.var_term_err = tk.BooleanVar(value=True)
         ttk.Checkbutton(bar, text="Check SYSTem:ERRor? after every command",
                         variable=self.var_term_err).pack(side="left", padx=12)
+        self.var_term_writes = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            bar, text="Service mode: allow device-changing commands",
+            variable=self.var_term_writes).pack(side="left", padx=8)
 
         row = ttk.Frame(t)
         row.pack(fill="x", padx=8, pady=4)
@@ -1229,7 +1334,7 @@ class SuiteApp(tk.Tk):
         theme.Button(row, text="Send",
                    command=self._terminal_send).pack(side="left")
 
-        ttk.Label(t, foreground="#555", wraplength=1000, justify="left",
+        ttk.Label(t, style="Dim.TLabel", wraplength=1000, justify="left",
                   text=("Hand-test commands on any connected instrument, over "
                         "whichever connection it uses. Additel documents "
                         "SYSTem:ERRor? as the way to tell whether a command "
@@ -1270,7 +1375,7 @@ class SuiteApp(tk.Tk):
         theme.Button(find, text="Find unit command",
                    command=lambda: self._term_sweep("unit")
                    ).pack(side="left", padx=4, pady=4)
-        ttk.Label(find, foreground="#555",
+        ttk.Label(find, style="Dim.TLabel",
                   text="Tries every known form and keeps the one that answers."
                   ).pack(side="left", padx=8)
 
@@ -1342,6 +1447,13 @@ class SuiteApp(tk.Tk):
             messagebox.showerror("Terminal",
                                  "Select a connected heat source first.")
             return
+        if any(engine.is_active and engine.heat_source is source
+               for engine in self.engines.values()):
+            messagebox.showerror(
+                "Calibration in progress",
+                f"{source.name} is part of an active calibration. Command "
+                "discovery and profile changes are blocked until it stops.")
+            return
 
         def work():
             try:
@@ -1367,6 +1479,13 @@ class SuiteApp(tk.Tk):
         cmd = self.var_term_cmd.get().strip()
         if not cmd:
             return
+        is_query = cmd.rstrip().endswith("?")
+        if not is_query and not self.var_term_writes.get():
+            messagebox.showerror(
+                "Query-only terminal",
+                "Device-changing commands are blocked by default. Use a read "
+                "query ending in '?', or explicitly enable Service mode.")
+            return
         self._refresh_terminal_targets()
         link, lock, name = self._term_link()
         if link is None:
@@ -1375,13 +1494,22 @@ class SuiteApp(tk.Tk):
                 f"{name} is not connected. Connect it on the Instruments tab "
                 "first.")
             return
+        if not is_query:
+            active = [engine for engine in self.engines.values()
+                      if engine.is_active and
+                      (name == "ADT286" or engine.heat_source.name == name)]
+            if active:
+                messagebox.showerror(
+                    "Calibration in progress",
+                    f"{name} is part of an active calibration. Device-changing "
+                    "terminal commands are blocked until that run stops.")
+                return
         check = bool(self.var_term_err.get())
 
         def work():
             try:
                 with lock:
                     self._term_log("TX", f"{name}  <-  {cmd}")
-                    is_query = cmd.rstrip().endswith("?")
                     reply = (link.query(cmd) if is_query
                              else (link.write(cmd) or ""))
                     self._term_log("RX", reply if reply
@@ -1420,6 +1548,15 @@ class SuiteApp(tk.Tk):
 
     # --------------------------------------------------------------- ADT --
     def _connect_adt(self):
+        if any(engine.is_active for engine in self.engines.values()):
+            messagebox.showerror(
+                "Runs in progress",
+                "The readout connection cannot be changed while a calibration "
+                "is running.")
+            return
+        if self.adt.is_open:
+            messagebox.showinfo("ADT286", "The ADT286 is already connected.")
+            return
         target = self.pick_adt.get_target()
         if not target_is_set(target):
             messagebox.showerror(
@@ -1458,12 +1595,18 @@ class SuiteApp(tk.Tk):
         run. It also sets the floor for the stability window, so the profile
         check is re-run against the new rate.
         """
+        if any(engine.is_active for engine in self.engines.values()):
+            messagebox.showerror(
+                "Runs in progress",
+                "The acquisition interval is locked while a calibration is "
+                "running.")
+            return
         try:
             value = float(str(self.var_poll.get()).replace(",", "."))
         except ValueError:
             messagebox.showerror("Read interval", "Enter a number of seconds.")
             return
-        value = max(0.2, value)
+        value = max(self.adt.minimum_poll_interval, value)
         self.adt.poll_interval = value
         self._log("INFO", f"The 286 will now be read every {value:g} s. "
                           f"Stability windows should be at least "
@@ -1560,6 +1703,13 @@ class SuiteApp(tk.Tk):
         if source is None or not source.is_open:
             messagebox.showerror("Check commands",
                                  f"{name} is not connected.")
+            return
+        if any(engine.is_active and engine.heat_source is source
+               for engine in self.engines.values()):
+            messagebox.showerror(
+                "Run in progress",
+                "Command discovery can move the heat source set point. Stop "
+                f"the calibration using {name} before running discovery.")
             return
 
         def work():
@@ -1681,11 +1831,16 @@ class SuiteApp(tk.Tk):
 
     def _form_to_profile(self):
         p = default_profile(self.var_p_name.get().strip() or "New profile")
+        input_errors = []
         p["heat_source"] = self.var_p_source.get()
         p["reference_channel"] = self.var_p_ref.get()
         p["dut_channels"] = [self.lst_p_duts.get(i)
                              for i in self.lst_p_duts.curselection()]
-        p["setpoints"] = self._parse_setpoints(self.var_p_setpoints.get())
+        p["setpoints"], bad = self._parse_numeric_list(
+            self.var_p_setpoints.get())
+        if bad:
+            input_errors.append("Set points contain invalid value(s): "
+                                + ", ".join(bad))
         for key, var, cast in (
                 ("stability_band", self.var_p_band, float),
                 ("stability_window", self.var_p_window, float),
@@ -1695,34 +1850,56 @@ class SuiteApp(tk.Tk):
                 ("soak_seconds", self.var_p_soak, float),
                 ("setpoint_tolerance", self.var_p_sptol, float)):
             try:
-                p[key] = cast(str(var.get()).strip().replace(",", "."))
-            except ValueError:
-                pass
+                value = cast(str(var.get()).strip().replace(",", "."))
+                if isinstance(value, float) and not math.isfinite(value):
+                    raise ValueError
+                p[key] = value
+            except (TypeError, ValueError, OverflowError):
+                input_errors.append(
+                    f"{key.replace('_', ' ').title()} is not a valid number.")
         p["tolerance_mode"] = self.var_tol_mode.get()
         try:
             p["tolerance"] = float(str(self.var_tol.get()).replace(",", "."))
-        except ValueError:
-            pass
-        p["tolerances"] = self._parse_setpoints(self.var_tol_list.get())
+            if not math.isfinite(p["tolerance"]):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            input_errors.append("Tolerance is not a valid finite number.")
+        p["tolerances"], bad = self._parse_numeric_list(
+            self.var_tol_list.get())
+        if bad:
+            input_errors.append("Per-point tolerances contain invalid value(s): "
+                                + ", ".join(bad))
         p["require_near_setpoint"] = bool(self.var_p_near.get())
         p["enable_output"] = bool(self.var_p_enable.get())
         p["disable_at_end"] = bool(self.var_p_disable.get())
         p["send_password"] = bool(self.var_p_pw.get())
         p["on_timeout"] = self.var_p_timeout.get()
+        p["_input_errors"] = input_errors
         return p
 
     @staticmethod
     def _parse_setpoints(text):
+        return SuiteApp._parse_numeric_list(text)[0]
+
+    @staticmethod
+    def _parse_numeric_list(text):
         out = []
+        bad = []
         for chunk in (text or "").replace(";", ",").split(","):
-            chunk = chunk.strip().replace(" ", "")
+            chunk = chunk.strip()
             if not chunk:
                 continue
+            if any(character.isspace() for character in chunk):
+                bad.append(chunk)
+                continue
             try:
-                out.append(float(chunk))
-            except ValueError:
-                pass
-        return out
+                value = float(chunk)
+                if not math.isfinite(value):
+                    raise ValueError
+                out.append(value)
+            except (ValueError, OverflowError):
+                bad.append(chunk)
+        return out, bad
 
     def _profile_to_form(self, p):
         self.var_p_name.set(p.get("name", ""))
@@ -1742,7 +1919,7 @@ class SuiteApp(tk.Tk):
         self.var_tol_list.set(", ".join(f"{v:g}"
                                         for v in p.get("tolerances", [])))
         self._sync_tolerance_mode()
-        self.var_p_near.set(bool(p.get("require_near_setpoint")))
+        self.var_p_near.set(True)
         self.var_p_enable.set(bool(p.get("enable_output", True)))
         self.var_p_disable.set(bool(p.get("disable_at_end", True)))
         self.var_p_pw.set(bool(p.get("send_password")))
@@ -1786,6 +1963,11 @@ class SuiteApp(tk.Tk):
 
     def _save_profile(self):
         p = self._form_to_profile()
+        if p.get("_input_errors"):
+            messagebox.showerror("Profile needs attention",
+                                 "\n\n".join(p["_input_errors"]))
+            return None
+        p.pop("_input_errors", None)
         if not p["name"].strip():
             messagebox.showerror("Save", "Give the profile a name first.")
             return None
@@ -1802,6 +1984,11 @@ class SuiteApp(tk.Tk):
 
     def _duplicate_profile(self):
         p = self._form_to_profile()
+        if p.get("_input_errors"):
+            messagebox.showerror("Profile needs attention",
+                                 "\n\n".join(p["_input_errors"]))
+            return
+        p.pop("_input_errors", None)
         p["name"] = p["name"] + " copy"
         self.run_profiles.append(p)
         self._save(RUN_LIB, self.run_profiles)
@@ -1820,9 +2007,12 @@ class SuiteApp(tk.Tk):
     def _validate_profile(self, quiet=False):
         p = self._form_to_profile()
         hs = self.sources.get(p["heat_source"])
-        problems = validate_profile(p, hs, self.adt.channels or None,
-                                    getattr(self.adt, "poll_interval", None)
-                                    if self.adt.is_open else None)
+        problems = list(p.get("_input_errors", []))
+        problems += validate_profile(
+            p, hs, list(self.adt.channels) if self.adt.is_open else None,
+            getattr(self.adt, "poll_interval", None)
+            if self.adt.is_open else None,
+            getattr(self.adt, "unit", "") if self.adt.is_open else None)
         busy = self.registry.in_use()
         for c in [p["reference_channel"]] + p["dut_channels"]:
             if c and c in busy:
@@ -1901,7 +2091,9 @@ class SuiteApp(tk.Tk):
             messagebox.showinfo("Stop run",
                                 "Select a run in the table first.")
             return
-        self.engines[run_id].stop()
+        if not self.engines[run_id].stop():
+            messagebox.showinfo("Stop run", "That calibration is not running.")
+            return
         self._log("WARN", f"Stopping '{self.engines[run_id].profile.get('name')}'…")
 
     def _stop_all(self):
@@ -1923,6 +2115,26 @@ class SuiteApp(tk.Tk):
             return (None, None)
         return (reading.temperature, max(0.0, time.time() - reading.timestamp))
 
+    def _display_frame(self, engine):
+        """Values from one real scan cycle, or the run's last stored sample."""
+        channels = ([engine.profile.get("reference_channel", "")] +
+                    list(engine.profile.get("dut_channels", [])))
+        if engine.is_active:
+            reference = self.adt.latest(channels[0]) if channels[0] else None
+            if reference is None:
+                return {}, None, None
+            frame = self.adt.snapshot(channels, cycle=reference.cycle)
+            values = {channel: reading.temperature
+                      for channel, reading in frame.items()
+                      if reading is not None and reading.temperature is not None}
+            return values, reference.timestamp, reference.cycle
+        if engine.results and engine.results[-1].samples:
+            sample = engine.results[-1].samples[-1]
+            values = {channels[0]: sample.get("ref")}
+            values.update(dict(sample.get("duts", {})))
+            return values, sample.get("t"), sample.get("cycle")
+        return {}, None, None
+
     def _refresh_live_panel(self):
         """Reference and DUT readings for the selected (or only) run."""
         for row in self.tbl_live.get_children():
@@ -1936,12 +2148,17 @@ class SuiteApp(tk.Tk):
             self.lbl_live_note.configure(
                 text="Select a run above to see its channels.")
             return
-        unit = getattr(self.adt, "unit", "") or "°C"
+        unit = dict(getattr(engine, "evidence", {}) or {}).get(
+            "readout_unit") or "(unit not reported)"
         ref_ch = engine.profile.get("reference_channel", "")
-        ref_value, ref_age = self._live(ref_ch)
+        values, acquired, _cycle = self._display_frame(engine)
+        ref_value = values.get(ref_ch)
+        ref_age = (None if acquired is None else
+                   max(0.0, time.time() - acquired))
         rows = [(ref_ch, "reference probe", ref_value, None, ref_age)]
         for ch in engine.profile.get("dut_channels", []):
-            value, age = self._live(ch)
+            value = values.get(ch)
+            age = ref_age if value is not None else None
             error = (None if value is None or ref_value is None
                      else value - ref_value)
             rows.append((ch, "device under test", value, error, age))
@@ -1956,15 +2173,18 @@ class SuiteApp(tk.Tk):
                         "" if error is None else f"{error:+.3f} {unit}",
                         "—" if age is None else f"{age:.0f} s ago"))
         name = engine.profile.get("name", "")
-        if stale:
+        if stale and engine.is_active:
             self.lbl_live_note.configure(
                 text=f"{name}: readings are going stale — the 286's scan may "
                      "have been interrupted. It is being re-established "
                      "automatically.")
-        else:
+        elif engine.is_active:
             self.lbl_live_note.configure(
                 text=f"{name}: live from the shared scan, updated every "
                      f"{getattr(self.adt, 'poll_interval', 1):g} s.")
+        else:
+            self.lbl_live_note.configure(
+                text=f"{name}: last immutable device sample from this run.")
 
     def _refresh_run_table(self):
         """Keep one rack strip per run, in sync with the engines."""
@@ -1996,10 +2216,11 @@ class SuiteApp(tk.Tk):
                               f"{eng.profile.get('reference_channel', '')}",
                               phase, kind)
 
-            unit = getattr(self.adt, "unit", "") or "°C"
-            ref_value, _age = self._live(eng.profile.get("reference_channel"))
-            if ref_value is None:
-                ref_value = eng.last_reference
+            unit = dict(getattr(eng, "evidence", {}) or {}).get(
+                "readout_unit") or "(unit not reported)"
+            frame_values, _acquired, _cycle = self._display_frame(eng)
+            ref_value = frame_values.get(
+                eng.profile.get("reference_channel"))
             points = eng.profile.get("setpoints", []) or [1]
             done = len(eng.results)
             strip.update_values(
@@ -2014,7 +2235,7 @@ class SuiteApp(tk.Tk):
 
             tol = self._tolerance_for(eng)
             for channel in eng.profile.get("dut_channels", []):
-                value, _ = self._live(channel)
+                value = frame_values.get(channel)
                 error = (None if value is None or ref_value is None
                          else value - ref_value)
                 strip.update_channel(channel, error, tol)
@@ -2048,7 +2269,8 @@ class SuiteApp(tk.Tk):
                 self._monitor_channels = None
             return
 
-        unit = getattr(self.adt, "unit", "") or "°C"
+        unit = dict(getattr(engine, "evidence", {}) or {}).get(
+            "readout_unit") or "(unit not reported)"
         tol = self._tolerance_for(engine)
         signature = (run_id, tuple(engine.profile.get("dut_channels", [])), tol)
         if signature != self._monitor_channels:
@@ -2070,9 +2292,8 @@ class SuiteApp(tk.Tk):
             f"±{tol:g} {unit}",
             engine.phase if engine.is_active else engine.state, kind)
 
-        ref_value, _age = self._live(engine.profile.get("reference_channel"))
-        if ref_value is None:
-            ref_value = engine.last_reference
+        frame_values, acquired, cycle = self._display_frame(engine)
+        ref_value = frame_values.get(engine.profile.get("reference_channel"))
         points = engine.profile.get("setpoints", [])
         self.monitor.update_values(
             "—" if ref_value is None else f"{ref_value:.4f} {unit}",
@@ -2081,13 +2302,14 @@ class SuiteApp(tk.Tk):
             f"{len(engine.results)} of {len(points)} points")
 
         # keep a rolling history for the curve
-        if ref_value is not None:
+        if ref_value is not None and acquired is not None:
             hist = self.history.setdefault(run_id, deque(maxlen=600))
-            now = time.time()
-            if not hist or now - hist[-1][0] >= 0.2:
-                hist.append((now, ref_value))
+            last_cycle = self.history_cycles.get(run_id)
+            if cycle is not None and cycle != last_cycle:
+                hist.append((acquired, ref_value))
+                self.history_cycles[run_id] = cycle
             window = float(engine.profile.get("stability_window") or 60)
-            cutoff = now - max(window * 2.5, 30)
+            cutoff = acquired - max(window * 2.5, 30)
             while len(hist) > 2 and hist[0][0] < cutoff:
                 hist.popleft()
             self.monitor.curve.show(
@@ -2097,7 +2319,7 @@ class SuiteApp(tk.Tk):
                 window=window)
 
         for channel in engine.profile.get("dut_channels", []):
-            value, _ = self._live(channel)
+            value = frame_values.get(channel)
             error = (None if value is None or ref_value is None
                      else value - ref_value)
             self.monitor.update_channel(channel, error, tol)
@@ -2139,19 +2361,38 @@ class SuiteApp(tk.Tk):
         eng = self._engine_for_results()
         for row in self.tbl_results.get_children():
             self.tbl_results.delete(row)
+        for row in self.tbl_raw.get_children():
+            self.tbl_raw.delete(row)
         if eng is None:
             self.plot.show([])
+            self.tbl_raw.configure(columns=())
+            self.lbl_result_status.configure(text="NO RUN SELECTED",
+                                             style="Invalid.TLabel")
             return
         duts = list(eng.profile.get("dut_channels", []))
+        overall = export._overall(eng)
+        if overall.startswith("PASS"):
+            status_text, status_style = "PASSED", "Pass.TLabel"
+        elif overall.startswith("FAIL"):
+            status_text, status_style = "FAILED", "Fail.TLabel"
+        elif overall.startswith("INCOMPLETE"):
+            status_text, status_style = "INCOMPLETE", "Invalid.TLabel"
+        elif overall.startswith("NOT VALID"):
+            status_text, status_style = "NOT VALID", "Invalid.TLabel"
+        else:
+            status_text, status_style = "NOT ASSESSED", "Invalid.TLabel"
+        self.lbl_result_status.configure(text=status_text, style=status_style)
         series = {c: [] for c in duts}
         for r in eng.results:
             ref = r.reference or {}
             for ch in duts:
                 d = r.duts.get(ch, {})
                 verdict = d.get("in_tolerance")
+                point_invalid = r.verdict == "invalid"
                 self.tbl_results.insert(
                     "", "end",
-                    tags=("fail",) if verdict is False else (),
+                    tags=(("invalid",) if point_invalid else
+                          ("fail",) if verdict is False else ()),
                     values=(f"{r.setpoint:g}",
                             "yes" if r.stable else "NO",
                             _f(ref.get("mean")), _f(ref.get("sd"), 4),
@@ -2159,14 +2400,100 @@ class SuiteApp(tk.Tk):
                             _f(d.get("error")),
                             "" if d.get("tolerance") is None
                             else f"±{d['tolerance']:g}",
-                            "" if verdict is None
-                            else ("PASS" if verdict else "FAIL"),
+                            "NOT VALID" if point_invalid else
+                            "" if verdict is None else
+                            ("PASS" if verdict else "FAIL"),
                             d.get("n", 0)))
-                if d.get("error") is not None:
+                if d.get("error") is not None and not point_invalid:
                     series[ch].append((r.setpoint, d["error"]))
+
+        raw_columns = ["setpoint", "phase", "sample", "device_time",
+                       "timestamp", "cycle", "source", "reference"] + [
+                           f"dut_{index}" for index, _ in enumerate(duts)] + [
+                           f"dut_time_{index}" for index, _ in enumerate(duts)] + [
+                            "source_setpoint", "source_setpoint_unit_raw",
+                            "source_setpoint_unit", "source_setpoint_confirmed",
+                            "source_unit_raw",
+                            "source_verified_unit",
+                            "source_unit_query_succeeded",
+                            "source_unit_verified"]
+        self.tbl_raw.configure(columns=raw_columns)
+        raw_titles = ["Set point", "Phase", "Sample",
+                      "Device acquisition time", "Host receipt time",
+                      "Scan cycle", "Source", "Reference"] + duts + [
+                           f"{channel} device acquisition time" for channel in duts] + [
+                           "Heat-source set point (device text)",
+                            "Set-point reply unit token (device text)",
+                            "Set-point reply unit",
+                            "Set-point readback confirmed",
+                            "Live unit query (device text)",
+                           "Live unit query (parsed)",
+                           "Live unit query succeeded",
+                           "Unit evidence valid"]
+        raw_widths = ([90, 85, 65, 210, 230, 90, 190, 120]
+                      + [120] * len(duts) + [210] * len(duts)
+                      + [220, 190, 120, 150, 190, 120, 150, 130])
+        for column, title, width in zip(raw_columns, raw_titles, raw_widths):
+            self.tbl_raw.heading(column, text=title)
+            self.tbl_raw.column(column, width=width, minwidth=60, anchor="w")
+        for result in eng.results:
+            for check in getattr(result, "source_checks", ()):
+                timestamp = datetime.fromtimestamp(check["t"]).astimezone(
+                ).isoformat(timespec="microseconds")
+                values = [
+                    repr(float(result.setpoint)), "source check",
+                    check.get("context", ""), "", timestamp, "",
+                    "Heat-source set-point readback", "",
+                ] + [""] * (2 * len(duts)) + [
+                    check.get("raw", ""),
+                    check.get("readback_unit_raw", ""),
+                    check.get("readback_unit", ""),
+                    "yes" if check.get("confirmed") else "NO",
+                    check.get("unit_raw", ""), check.get("unit", ""),
+                    "yes" if check.get("unit_query_succeeded") else "NO",
+                    "yes" if check.get("unit_verified") else "NO"]
+                self.tbl_raw.insert("", "end", values=values)
+            for index, sample in enumerate(
+                    getattr(result, "stability_samples", ()), 1):
+                timestamp = datetime.fromtimestamp(sample["t"]).astimezone(
+                ).isoformat(timespec="microseconds")
+                values = [
+                    f"{result.setpoint:g}", "stability", index,
+                    sample.get("device_timestamp", ""), timestamp,
+                    sample.get("cycle", ""), sample.get("source", ""),
+                    sample.get("ref_raw", ""),
+                ] + [""] * (2 * len(duts)) + [
+                    "", "", "", "", "", "", "", ""]
+                self.tbl_raw.insert("", "end", values=values)
+            for index, sample in enumerate(result.samples, 1):
+                raw_duts = sample.get("duts_raw", {})
+                timestamp = datetime.fromtimestamp(sample["t"]).astimezone(
+                ).isoformat(timespec="microseconds")
+                values = [
+                    f"{result.setpoint:g}", "sampling", index,
+                    sample.get("device_timestamp", ""), timestamp,
+                    sample.get("cycle", ""), sample.get("source", ""),
+                    sample.get("ref_raw", ""),
+                ] + [raw_duts.get(channel) or
+                     "" for channel in duts] + [
+                          sample.get("device_timestamps", {}).get(channel, "")
+                          for channel in duts] + [
+                          sample.get("source_setpoint_raw", ""),
+                           sample.get("source_setpoint_unit_raw", ""),
+                           sample.get("source_setpoint_unit", ""),
+                           ("yes" if sample.get("source_setpoint_confirmed")
+                            else "NO"),
+                           sample.get("source_unit_raw", ""),
+                          sample.get("source_verified_unit", ""),
+                          ("yes" if sample.get("source_unit_query_succeeded")
+                           else "NO"),
+                          "yes" if sample.get("source_unit_verified") else "NO"]
+                self.tbl_raw.insert("", "end", values=values)
+        unit = dict(getattr(eng, "evidence", {}) or {}).get(
+            "readout_unit") or eng.heat_source.unit
         self.plot.show(
             [{"name": c, "points": pts} for c, pts in series.items() if pts],
-            x_label=f"Set point ({eng.heat_source.unit})",
+            x_label=f"Set point ({unit})",
             y_label="Error (DUT − reference)",
             title=f"{eng.profile.get('name','')} — error against the reference")
 
@@ -2174,6 +2501,13 @@ class SuiteApp(tk.Tk):
         eng = self._engine_for_results()
         if eng is None or not eng.results:
             messagebox.showinfo("Export", "No results to export yet.")
+            return
+        if eng.is_active:
+            messagebox.showinfo(
+                "Run still active",
+                "Finish or stop this calibration before exporting. This keeps "
+                "the summary and immutable device-reading files on the same "
+                "final result set.")
             return
         folder = filedialog.askdirectory(title="Choose a folder for the CSVs")
         if not folder:

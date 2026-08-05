@@ -14,7 +14,7 @@ Commands used (from Additel's published ADT286 command set):
     MODule:CONFig? <index>         channel names + configuration per module
     CHANnel:CONFig? "<name>"       one channel's configuration
     SCAN:MULT:STARt <rate>,"<ch,ch>"   configure + start multi-channel scan
-    SCAN:DATA:Last?                most recent scan data for those channels
+    SCAN:DATA:Last? 1              most recent scan data + device timestamp
     SCAN:STOP                      stop scanning
     UNIT:TEMPerature?              system temperature unit
     SYSTem:ERRor?                  error queue
@@ -24,8 +24,11 @@ Reply format for SCAN:DATA:Last? (per channel, groups split by ';'):
 e.g. "REF1,1281,1,28.258167,28.258167,1001,1,33.512077;"
 """
 
+import math
+import re
 import threading
 import time
+from dataclasses import dataclass
 
 from .transport import (describe_target, make_link,
                         normalize_target, target_is_set)
@@ -43,23 +46,33 @@ CHANNEL_TYPES = {
 }
 
 SCAN_RATES = ("100", "1000", "4000")
+DEVICE_TIME_RE = re.compile(
+    r"\d{4}:\d{2}:\d{2}\s+\d{2}:\d{2}:\d{2}(?:[ .:]\d{1,9})?")
 
 
+@dataclass(frozen=True)
 class Reading:
-    """One channel's most recent scan sample."""
+    """One immutable, device-sourced channel reading.
 
-    __slots__ = ("channel", "temperature", "unit", "electrical",
-                 "electrical_unit", "cycle", "timestamp")
+    ``timestamp`` and ``monotonic`` are host receipt metadata.
+    ``device_timestamp`` is the exact acquisition-time token requested from
+    the ADT286 and is used to prove that a poll represents a new scan.  Numeric
+    tokens reported by the device are retained separately so raw exports do
+    not lose resolution through display formatting.
+    """
 
-    def __init__(self, channel, temperature=None, unit=None, electrical=None,
-                 electrical_unit=None, cycle=0, timestamp=0.0):
-        self.channel = channel
-        self.temperature = temperature
-        self.unit = unit
-        self.electrical = electrical
-        self.electrical_unit = electrical_unit
-        self.cycle = cycle
-        self.timestamp = timestamp
+    channel: str
+    temperature: object = None
+    unit: object = None
+    electrical: object = None
+    electrical_unit: object = None
+    cycle: int = 0
+    timestamp: float = 0.0
+    monotonic: float = 0.0
+    device_timestamp: str = ""
+    raw_temperature: str = ""
+    raw_electrical: str = ""
+    source: str = "ADT286 SCAN:DATA:Last? 1"
 
     def __repr__(self):                                   # pragma: no cover
         return (f"<Reading {self.channel} {self.temperature}{self.unit or ''} "
@@ -75,11 +88,25 @@ def parse_scan_data(payload):
     out = {}
     if not payload:
         return out
-    for group in payload.strip().strip('"').split(";"):
+    clean_payload = payload.strip().strip('"')
+    all_device_times = DEVICE_TIME_RE.findall(clean_payload)
+    shared_device_time = (all_device_times[0]
+                          if len(set(all_device_times)) == 1 else "")
+    for group in clean_payload.split(";"):
         group = group.strip()
         if not group:
             continue
-        f = [x.strip() for x in group.split(",")]
+        device_time = ""
+        fields = []
+        for raw_field in group.split(","):
+            field = raw_field.strip().strip('"')
+            match = DEVICE_TIME_RE.search(field)
+            if match:
+                device_time = match.group(0)
+                continue
+            fields.append(field)
+        device_time = device_time or shared_device_time
+        f = fields
         if len(f) < 3 or not f[0]:
             continue
         name = f[0]
@@ -89,25 +116,34 @@ def parse_scan_data(payload):
         except ValueError:
             continue
         elec = None
-        if len(f) > 3 and f[3]:
+        raw_elec = f[3] if len(f) > 3 else ""
+        if raw_elec:
             try:
-                elec = float(f[3])
+                candidate = float(raw_elec)
+                elec = candidate if math.isfinite(candidate) else None
             except ValueError:
                 elec = None
         temp = t_unit = None
+        raw_temp = ""
         idx = 3 + 2 * n_elec              # raw + filtered per electrical point
         if len(f) > idx + 1:
             try:
                 unit_id = int(f[idx])
                 m = int(f[idx + 1])
-                if unit_id in TEMP_UNIT_IDS and m >= 1 and len(f) > idx + 2:
-                    temp = float(f[idx + 2])
+                if m >= 1 and len(f) > idx + 2:
+                    raw_temp = f[idx + 2]
+                if unit_id in TEMP_UNIT_IDS and raw_temp:
+                    candidate = float(raw_temp)
+                    temp = candidate if math.isfinite(candidate) else None
                     t_unit = TEMP_UNIT_IDS[unit_id]
             except (ValueError, IndexError):
                 pass
         out[name] = {"temperature": temp, "unit": t_unit, "electrical": elec,
                      "electrical_unit": ELEC_UNIT_IDS.get(elec_unit,
-                                                          str(elec_unit))}
+                                                          str(elec_unit)),
+                     "raw_temperature": raw_temp,
+                     "raw_electrical": raw_elec,
+                     "device_timestamp": device_time}
     return out
 
 
@@ -174,9 +210,11 @@ def parse_channel_config(payload):
     # fields; index 9 in the documented examples.
     if len(f) > 9 and f[9] and not f[9].isdigit():
         sensor = f[9]
+    sensor_serial = f[10] if len(f) > 10 else ""
     return {"name": f[0], "enabled": f[1] == "1", "label": f[2],
             "type": ctype, "type_name": CHANNEL_TYPES.get(ctype, f"type {ctype}"),
-            "sensor": sensor}
+            "sensor": sensor, "serial": sensor_serial,
+            "raw": str(payload or "").strip()}
 
 
 class Adt286:
@@ -207,6 +245,9 @@ class Adt286:
         self._last_recovery = 0.0
         self.recoveries = 0
         self.on_recovery = None         # optional callback(message)
+        self._last_poll_started = 0.0
+        self._last_device_times = {}
+        self.freshness_supported = None
 
     # ------------------------------------------------------------ session --
     @property
@@ -215,6 +256,8 @@ class Adt286:
 
     def connect(self, target, baud=9600):
         """Connect over USB/serial or the network (Ethernet / Wi-Fi)."""
+        if self.is_open:
+            raise RuntimeError("The ADT286 is already connected.")
         t = normalize_target(target, str(baud))
         if not target_is_set(t):
             raise RuntimeError("No port or address given for the ADT286.")
@@ -257,8 +300,11 @@ class Adt286:
                     pass
             if self.link is not None:
                 self.link.close()
-        self._subs.clear()
-        self._readings.clear()
+        with self.lock:
+            self._subs.clear()
+            self._readings.clear()
+            self._last_device_times.clear()
+            self.freshness_supported = None
         self.log("INFO", "ADT286 disconnected.")
 
     # ----------------------------------------------------------- channels --
@@ -299,7 +345,11 @@ class Adt286:
         """Add an owner's channels to the shared scan."""
         with self.lock:
             self._subs[owner] = list(channels)
-            self._restart_scan()
+            try:
+                self._restart_scan(strict=True)
+            except Exception:
+                self._subs.pop(owner, None)
+                raise
 
     def unsubscribe(self, owner):
         with self.lock:
@@ -307,36 +357,67 @@ class Adt286:
             self._restart_scan()
 
     def subscribed_channels(self):
-        seen = []
-        for chans in self._subs.values():
-            for c in chans:
-                if c not in seen:
-                    seen.append(c)
-        return seen
+        with self.lock:
+            seen = []
+            for chans in self._subs.values():
+                for c in chans:
+                    if c not in seen:
+                        seen.append(c)
+            return seen
 
-    def _restart_scan(self):
+    @property
+    def scan_period(self):
+        """Configured device scan period in seconds."""
+        try:
+            return max(0.1, float(self.scan_rate) / 1000.0)
+        except (TypeError, ValueError):
+            return 1.0
+
+    @property
+    def minimum_poll_interval(self):
+        """Fastest safe query interval for SCAN:DATA:Last?."""
+        return self.scan_period
+
+    def _restart_scan(self, strict=False):
         """Reconfigure the single shared scan for the union of subscribers."""
         chans = self.subscribed_channels()
         if self.link is None or not self.link.is_open:
-            return
+            if strict:
+                raise RuntimeError("The ADT286 connection is not open.")
+            return False
         if not chans:
             try:
                 self.link.write("SCAN:STOP")
                 self.log("INFO", "No subscribers left; scanning stopped.")
+                return True
             except Exception as e:
                 self.log("WARN", f"SCAN:STOP failed: {e}")
-            return
+                if strict:
+                    raise
+                return False
         cmd = f'SCAN:MULT:STARt {self.scan_rate},"{",".join(chans)}"'
         try:
             self.link.write(cmd)
+            # Anything cached predates this scan configuration.  Clearing it
+            # prevents the UI or a newly-started run from presenting it as a
+            # reading from the reconfigured scan.
+            for channel in chans:
+                self._readings.pop(channel, None)
+            self._last_poll_started = 0.0
             self._bad_polls = 0
             self.log("INFO", f"Scanning {len(chans)} channel(s): "
                              f"{', '.join(chans)}")
+            return True
         except Exception as e:
             self.log("FAIL", f"Could not start scan: {e}")
+            if strict:
+                raise
+            return False
 
     # ---------------------------------------------------------- polling ----
     def _start_poller(self):
+        if self._poll_thread is not None and self._poll_thread.is_alive():
+            return
         self._poll_stop.clear()
         self._poll_thread = threading.Thread(target=self._poll_loop,
                                              daemon=True)
@@ -358,29 +439,42 @@ class Adt286:
         if now - self._last_recovery < self.recover_min_gap:
             return False
         self._last_recovery = now
-        self.recoveries += 1
         message = (f"The 286 stopped returning scan data ({reason}). This "
                    "normally means its display was switched to another "
                    "function, which cancels the scan. Re-establishing it - "
                    "runs in progress will carry on.")
         self.log("WARN", message)
-        if self.on_recovery:
+        recovered = self._restart_scan()
+        if recovered:
+            self.recoveries += 1
+        if recovered and self.on_recovery:
             try:
                 self.on_recovery(message)
             except Exception:
                 pass
-        self._restart_scan()
-        self._bad_polls = 0
-        return True
+        if recovered:
+            self._bad_polls = 0
+            return True
+        self.log("FAIL", "The ADT286 scan could not be re-established on the "
+                         "current connection.")
+        return False
 
     def poll_once(self):
         """One scan read. Returns the number of channels updated."""
-        if (self.link is None or not self.link.is_open
-                or not self.subscribed_channels()):
+        requested = self.subscribed_channels()
+        if self.link is None or not self.link.is_open or not requested:
             return 0
         with self.lock:
+            # Request the device timestamp and also avoid querying faster than
+            # the configured scan period.  A software cycle is assigned only
+            # after every required channel reports a timestamp newer than its
+            # last accepted device acquisition.
+            started = time.monotonic()
+            if started - self._last_poll_started < self.minimum_poll_interval:
+                return 0
+            self._last_poll_started = started
             try:
-                payload = self.link.query("SCAN:DATA:Last?")
+                payload = self.link.query("SCAN:DATA:Last? 1")
             except Exception as e:
                 self.last_error = str(e)
                 self._note_bad_poll("the connection returned an error")
@@ -389,24 +483,77 @@ class Adt286:
             if not data:
                 self._note_bad_poll("no readings came back")
                 return 0
-            missing = [c for c in self.subscribed_channels() if c not in data]
-            if missing:
+            missing_device_times = [
+                c for c in requested
+                if c not in data or not data[c].get("device_timestamp")]
+            if missing_device_times:
+                for channel in requested:
+                    self._readings.pop(channel, None)
+                if self.freshness_supported is not False:
+                    self.log(
+                        "FAIL", "The ADT286 did not return device timestamps "
+                        "for SCAN:DATA:Last? 1. Calibration readings are "
+                        "withheld because a fresh physical scan cannot be "
+                        "proved.")
+                self.freshness_supported = False
+                self.last_error = "ADT286 device timestamps are unavailable"
+                return 0
+            self.freshness_supported = True
+            repeated_times = [
+                c for c in requested
+                if self._last_device_times.get(c) ==
+                data[c].get("device_timestamp")]
+            if repeated_times:
+                self._note_bad_poll(
+                    "the device acquisition timestamp did not advance for "
+                    + ", ".join(repeated_times))
+                return 0
+            unusable = [c for c in requested
+                        if c not in data or data[c]["temperature"] is None]
+            if unusable:
                 # The scan is running but no longer covers what we asked for.
                 self._note_bad_poll(
-                    f"{len(missing)} subscribed channel(s) missing from the "
-                    "scan")
-                if len(missing) == len(self.subscribed_channels()):
+                    f"{len(unusable)} subscribed channel(s) missing or invalid "
+                    "in the scan")
+                if len(unusable) == len(requested):
+                    for channel in requested:
+                        self._readings.pop(channel, None)
                     return 0
             else:
                 self._bad_polls = 0
             self._cycle += 1
             now = time.time()
-            for name, vals in data.items():
+            acquired = time.monotonic()
+            for name in requested:
+                vals = data.get(name)
+                if vals is None:
+                    self._readings.pop(name, None)
+                    continue
                 self._readings[name] = Reading(
-                    name, vals["temperature"], vals["unit"],
-                    vals["electrical"], vals["electrical_unit"],
-                    self._cycle, now)
-            return len(data)
+                    channel=name,
+                    temperature=vals["temperature"],
+                    unit=vals["unit"],
+                    electrical=vals["electrical"],
+                    electrical_unit=vals["electrical_unit"],
+                    cycle=self._cycle,
+                    timestamp=now,
+                    monotonic=acquired,
+                    device_timestamp=vals["device_timestamp"],
+                    raw_temperature=vals["raw_temperature"],
+                    raw_electrical=vals["raw_electrical"],
+                )
+            self._last_device_times.update(
+                {name: data[name]["device_timestamp"] for name in requested})
+            reported_units = {data[c]["unit"] for c in requested
+                              if c in data and data[c]["temperature"] is not None
+                              and data[c]["unit"]}
+            if len(reported_units) == 1:
+                reported = next(iter(reported_units))
+                if reported != self.unit:
+                    self.log("WARN", f"ADT286 scan unit changed from "
+                                     f"{self.unit or '(unknown)'} to {reported}.")
+                    self.unit = reported
+            return len(requested) - len(unusable)
 
     def _poll_loop(self):
         while not self._poll_stop.is_set():
@@ -414,17 +561,28 @@ class Adt286:
                 self.poll_once()
             except Exception as e:                        # pragma: no cover
                 self.last_error = str(e)
-            self._poll_stop.wait(self.poll_interval)
+            self._poll_stop.wait(max(self.poll_interval,
+                                     self.minimum_poll_interval))
 
     # ---------------------------------------------------------- readings ---
     def latest(self, channel):
         with self.lock:
             return self._readings.get(channel)
 
-    def snapshot(self, channels):
-        """Readings for several channels from the same scan cycle if possible."""
+    def snapshot(self, channels, cycle=None):
+        """Return immutable readings, optionally restricted to one cycle.
+
+        A channel that is absent or belongs to a different cycle maps to
+        ``None``.  Callers never receive a mixed-cycle sample by accident.
+        """
         with self.lock:
-            return {c: self._readings.get(c) for c in channels}
+            out = {}
+            for channel in channels:
+                reading = self._readings.get(channel)
+                out[channel] = (reading if reading is not None and
+                                (cycle is None or reading.cycle == cycle)
+                                else None)
+            return out
 
     @property
     def cycle(self):

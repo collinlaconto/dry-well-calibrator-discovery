@@ -14,9 +14,11 @@ Needs:  pip install pandas plotly openpyxl
 
 # -- Standard library ----------------------------------------------------------
 import os
+import math
 import re
 import sys
 import threading
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -641,9 +643,8 @@ def analyze_file(path: str):
 
     unit = unit_from_name(value_guess) if value_guess else None
     unit_source = "name" if unit else None
-    if unit is None and value_guess is not None and value_guess in df.columns:
-        unit = unit_from_values(df[value_guess])
-        unit_source = "values" if unit else None
+    # Never infer a calibration unit from magnitude. A valid 100 °C series is
+    # numerically indistinguishable from a plausible 100 °F series.
 
     return {
         "df": df, "sheet": sheet, "columns": list(df.columns),
@@ -696,6 +697,8 @@ def build_series(df: "pd.DataFrame", time_info: dict, value_col: str,
         abs_time = _stitch_elapsed_to_abs(df[time_info["col"]], start)
 
     values = pd.to_numeric(df[value_col].astype(str).str.strip(), errors="coerce")
+    values = values.where(values.map(
+        lambda value: value is not None and math.isfinite(float(value))))
     out = pd.DataFrame({"_abs_time": abs_time, "_value": values}).dropna()
     return out.sort_values("_abs_time").reset_index(drop=True)
 
@@ -749,14 +752,20 @@ def load_any(path: str, start: datetime = None, value_col: str = None,
     # Units: convert so everything shares one axis. A Fahrenheit logger drawn
     # against a Celsius reference looks plausible and is wrong by tens of
     # degrees, so this is done before anything is plotted or compared.
-    source_unit = unit or info.get("unit")
-    if convert_to and source_unit and source_unit != convert_to:
-        out = convert_series(out, source_unit, convert_to,
+    declared_unit = unit if unit not in (None, "", False) else unit_from_name(vcol)
+    source_unit = _validated_temperature_unit(declared_unit)
+    display_unit = _validated_display_unit(convert_to)
+    if display_unit and source_unit and source_unit != display_unit:
+        out = convert_series(out, source_unit, display_unit,
                              log_fn=lambda m: log_fn(
                                  f"{os.path.basename(path)}: {m}"))
-    elif convert_to and not source_unit:
-        log_fn(f"{os.path.basename(path)}: unit not stated; values used as "
-               f"°{convert_to}. Set it explicitly if that is wrong.")
+    elif display_unit and not source_unit:
+        raise ValueError(
+            f"{os.path.basename(path)}: temperature unit is not stated. "
+            "Select °C, °F, or K explicitly; values will not be guessed from "
+            "their magnitude.")
+    out.attrs["source_unit"] = source_unit
+    out.attrs["display_unit"] = display_unit or source_unit
     return out
 
 
@@ -791,6 +800,22 @@ def clip_to_window(df: "pd.DataFrame", name: str,
 
 def build_chart(probe_df, device_dfs, device_names, output_path):
     """Write a self-contained interactive HTML chart."""
+    labelled_frames = []
+    if probe_df is not None and not probe_df.empty:
+        labelled_frames.append(("Probe", probe_df))
+    labelled_frames.extend(
+        (name, frame) for frame, name in zip(device_dfs, device_names)
+        if frame is not None and not frame.empty
+    )
+    for name, frame in labelled_frames:
+        display_unit = _validated_temperature_unit(
+            frame.attrs.get("display_unit"))
+        if display_unit != "C":
+            stated = display_unit or "unstated"
+            raise ValueError(
+                f"Cannot build a Celsius-labelled chart: '{name}' contains "
+                f"{stated} display data. Convert it to C first.")
+
     if not HAS_PLOTLY:
         raise RuntimeError("plotly is not installed. Run: pip install plotly")
 
@@ -897,8 +922,8 @@ def run_pipeline(probe_path, start_dt, device_paths, output_path,
 # ==============================================================================
 # SECTION 7 -- TEMPERATURE UNITS
 # A Fahrenheit logger plotted against a Celsius reference produces a chart
-# that looks plausible and is wrong by tens of degrees. Units are detected
-# from the column name and, where that is silent, from the values themselves.
+# that looks plausible and is wrong by tens of degrees. Units are accepted
+# only from explicit headings, run evidence, or an operator selection.
 # ==============================================================================
 
 F_NAME = re.compile(r"(?:^|[^a-z])(?:deg\s*f|°\s*f|\bf\b|fahrenheit)(?:[^a-z]|$)",
@@ -926,25 +951,32 @@ def unit_from_name(column: str):
 
 
 def unit_from_values(values):
-    """Guess a unit from the numbers when the heading does not say.
-
-    Deliberately conservative: only ranges that cannot plausibly be another
-    unit are claimed, and anything ambiguous returns None so the operator is
-    asked rather than guessed at.
-    """
-    if values is None or len(values) == 0:
-        return None
-    numbers = pd.to_numeric(pd.Series(values), errors="coerce").dropna()
-    if len(numbers) < 3:
-        return None
-    low, high = numbers.min(), numbers.max()
-    if low > 200:
-        return "K"          # far above any bench temperature in C or F
-    if low > 50 and high < 250:
-        return "F"          # too warm for ambient C, sensible for F
-    if -60 < low and high < 45:
-        return "C"          # ordinary ambient and bath range in C
+    """Return no guess: calibration units may not be inferred from magnitude."""
     return None
+
+
+def _validated_temperature_unit(unit):
+    """Return a canonical explicit temperature unit, or None if unstated."""
+    if unit is None or unit is False:
+        return None
+    canonical = str(unit).strip().upper()
+    if not canonical:
+        return None
+    if canonical not in ("C", "F", "K"):
+        raise ValueError(
+            f"Unrecognised temperature unit {canonical!r}; choose C, F, or K.")
+    return canonical
+
+
+def _validated_display_unit(unit):
+    """Validate the load/chart display target; None/False disables conversion."""
+    if unit is None or unit is False:
+        return None
+    canonical = str(unit).strip().upper()
+    if canonical != "C":
+        raise ValueError(
+            f"Only conversion to Celsius is supported, not {canonical or unit}.")
+    return canonical
 
 
 def to_celsius(values, unit):
@@ -958,14 +990,20 @@ def to_celsius(values, unit):
 def convert_series(df, unit, target="C", log_fn=None):
     """Convert a loaded series into the target unit, in place-ish."""
     log = log_fn or (lambda m: None)
+    unit = str(unit or "").strip().upper()
+    target = str(target or "").strip().upper()
+    if unit and unit not in ("C", "F", "K"):
+        raise ValueError(
+            f"Unrecognised temperature unit {unit!r}; choose C, F, or K.")
+    if target not in ("", "C"):
+        raise ValueError(f"Only conversion to Celsius is supported, not {target}.")
     if not unit or unit == target:
         return df
     out = df.copy()
-    if target != "C":
-        raise ValueError(f"Only conversion to Celsius is supported, not {target}.")
     out["_value"] = to_celsius(out["_value"], unit).values
-    log(f"Converted from °{unit} to °C "
-        f"({df['_value'].iloc[0]:.2f} -> {out['_value'].iloc[0]:.2f})")
+    if not df.empty:
+        log(f"Converted from °{unit} to °C "
+            f"({df['_value'].iloc[0]:.2f} -> {out['_value'].iloc[0]:.2f})")
     return out
 
 
@@ -977,27 +1015,101 @@ def convert_series(df, unit, target="C", log_fn=None):
 # comparison is against the same data the certificate was built from.
 # ==============================================================================
 
-def series_from_run(engine, channel=None):
+_DEVICE_TIMESTAMP_FORMATS = (
+    "%Y:%m:%d %H:%M:%S %f",
+    "%Y:%m:%d %H:%M:%S.%f",
+    "%Y:%m:%d %H:%M:%S:%f",
+)
+
+
+def _parse_device_timestamp(value):
+    """Parse an ADT device-acquisition timestamp without using a host clock."""
+    if not isinstance(value, str):
+        raise ValueError("device acquisition timestamp is not text")
+    token = " ".join(value.strip().strip('"').split())
+    if not token:
+        raise ValueError("device acquisition timestamp is missing")
+    for timestamp_format in _DEVICE_TIMESTAMP_FORMATS:
+        try:
+            return datetime.strptime(token, timestamp_format)
+        except ValueError:
+            continue
+    raise ValueError(
+        f"invalid ADT device acquisition timestamp {value!r}")
+
+
+def series_from_run(engine, channel=None, convert_to="C", log_fn=None):
     """Build a probe series from a finished (or running) calibration.
 
     Returns the same two-column frame as load_any: _abs_time and _value.
-    With no channel given, the run's reference probe is used.
+    With no channel given, the run's reference probe is used.  Conversion, if
+    requested, is performed on this new display frame and never changes the
+    immutable samples retained by the calibration run.
     """
     if not HAS_PANDAS:
         raise RuntimeError("pandas is not installed. Run: pip install pandas")
     channel = channel or engine.profile.get("reference_channel")
+    reference_channel = engine.profile.get("reference_channel")
     times, values = [], []
-    for result in engine.results:
-        for sample in result.samples:
-            value = (sample.get("ref") if channel ==
-                     engine.profile.get("reference_channel")
+    for result_index, result in enumerate(engine.results, start=1):
+        for sample_index, sample in enumerate(result.samples, start=1):
+            value = (sample.get("ref") if channel == reference_channel
                      else sample.get("duts", {}).get(channel))
             if value is None:
                 continue
-            times.append(datetime.fromtimestamp(sample["t"]))
-            values.append(float(value))
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Run point {result_index}, sample {sample_index}, channel "
+                    f"{channel!r} has a non-numeric device value.") from exc
+            if not math.isfinite(numeric_value):
+                raise ValueError(
+                    f"Run point {result_index}, sample {sample_index}, channel "
+                    f"{channel!r} has a non-finite device value.")
+
+            device_times = sample.get("device_timestamps")
+            if device_times is not None and not isinstance(device_times, Mapping):
+                raise ValueError(
+                    f"Run point {result_index}, sample {sample_index} has invalid "
+                    "per-channel device timestamp evidence.")
+            timestamp_token = ((device_times or {}).get(channel))
+            if not timestamp_token and channel == reference_channel:
+                # Older reference samples retained this exact device token at
+                # the top level. It is device evidence, not a host-time fallback.
+                timestamp_token = sample.get("device_timestamp")
+            if not timestamp_token:
+                raise ValueError(
+                    f"Run point {result_index}, sample {sample_index}, channel "
+                    f"{channel!r} has no device acquisition timestamp.")
+            try:
+                device_time = _parse_device_timestamp(timestamp_token)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Run point {result_index}, sample {sample_index}, channel "
+                    f"{channel!r}: {exc}.") from exc
+            times.append(device_time)
+            values.append(numeric_value)
     frame = pd.DataFrame({"_abs_time": times, "_value": values})
-    return frame.sort_values("_abs_time").reset_index(drop=True)
+    frame = frame.sort_values("_abs_time").reset_index(drop=True)
+    evidence = dict(getattr(engine, "evidence", {}) or {})
+    reported = evidence.get("readout_unit") or getattr(
+        engine, "measurement_unit", "")
+    source_unit = unit_from_name(f"temperature ({reported})")
+    if not source_unit:
+        raise ValueError(
+            "The calibration run has no recognised pinned readout unit. "
+            "Its values cannot be relabelled for comparison.")
+    source_unit = _validated_temperature_unit(source_unit)
+    display_unit = _validated_display_unit(convert_to)
+    frame.attrs["source_unit"] = source_unit
+    frame.attrs["source_values_unchanged"] = True
+    if display_unit and source_unit != display_unit:
+        frame = convert_series(frame, source_unit, display_unit, log_fn=log_fn)
+    frame.attrs["source_unit"] = source_unit
+    frame.attrs["display_unit"] = display_unit or source_unit
+    frame.attrs["source_values_unchanged"] = True
+    return frame
 
 
 def run_channels(engine):

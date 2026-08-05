@@ -13,6 +13,8 @@ from .formats import (CONTROL_PAIRS, ERROR_QUERY, FAMILIES,
                       TERMINATORS, UNIT_CANDIDATES, VALUE_CANDIDATES,
                       WRITE_PAIRS, describe_unit_token, first_float,
                       plausible_unit_token, second_field, unit_token_for)
+from .formats import (unit_name_for_token, unit_name_from_reply,
+                      unit_token_from_reply)
 from .transport import (describe_target, make_link, normalize_target,
                         target_is_set)
 
@@ -34,6 +36,13 @@ class HeatSource:
         # a set-point write, and report it as the second field of the
         # set-point read. Whatever they report is echoed straight back.
         self.unit_token = str(profile.get("unit_token") or "")
+        self.reported_unit = unit_name_for_token(self.unit_token)
+        self.last_setpoint_command = ""
+        self.last_setpoint_readback_raw = ""
+        self.last_setpoint_readback_unit_raw = ""
+        self.last_setpoint_readback_unit = ""
+        self.last_unit_reply = ""
+        self.reported_unit = ""
 
     # ------------------------------------------------------------ helpers --
     @property
@@ -79,6 +88,8 @@ class HeatSource:
 
     def connect(self, target=None):
         """Connect over serial/Bluetooth SPP or the network."""
+        if self.is_open:
+            raise RuntimeError(f"{self.name} is already connected.")
         t = normalize_target(target if target is not None else self.target,
                              self.profile.get("baud") or "9600")
         if not target_is_set(t):
@@ -91,9 +102,19 @@ class HeatSource:
                 self.idn = self.link.query("*IDN?")
             except Exception:
                 self.idn = ""
+        # A stored profile token is useful for command formatting, but it is
+        # not current device evidence.  Require this connection to prove its
+        # live unit again.
+        self.reported_unit = ""
+        self.last_unit_reply = ""
         if self._cmd("sp_read"):
             try:
                 self._capture_unit(self.link.query(self._cmd("sp_read")))
+            except Exception:
+                pass
+        if self._cmd("unit"):
+            try:
+                self.read_unit()
             except Exception:
                 pass
         self.profile["target"] = t
@@ -115,13 +136,63 @@ class HeatSource:
         """Remember the unit the instrument reports alongside a value."""
         token = second_field(reply)
         if token and not plausible_unit_token(token):
+            self.reported_unit = ""
+            self.last_unit_reply = str(token)
             return reply          # another number, not a unit - ignore it
-        if token and token != self.unit_token:
+        if not token:
+            self.reported_unit = ""
+            self.last_unit_reply = ""
+            return reply
+        self.last_unit_reply = str(token)
+        reported = unit_name_for_token(token)
+        self.reported_unit = reported
+        # Never replace a proven device token with an unrecognised string.
+        if reported and token != self.unit_token:
             self.unit_token = token
             self.profile["unit_token"] = token
             self.log("INFO", f"{self.name}: unit token is "
                              f"{describe_unit_token(token)}")
+        if reported:
+            if reported != self.unit:
+                self.log("WARN", f"{self.name}: instrument reports {reported}, "
+                                 f"but its configured range is in {self.unit}.")
         return reply
+
+    def read_unit(self):
+        """Read and retain the heat source's current device-reported unit."""
+        cmd = self._cmd("unit")
+        if not cmd:
+            return ""
+        # A failed query must not leave a previous reply looking current.
+        self.last_unit_reply = ""
+        self.reported_unit = ""
+        with self.lock:
+            reply = self.link.query(cmd)
+        self.last_unit_reply = str(reply or "")
+        reported = unit_name_from_reply(reply)
+        self.reported_unit = reported
+        if reported:
+            token = unit_token_from_reply(reply)
+            if token:
+                self.unit_token = token
+                self.profile["unit_token"] = token
+            if reported != self.unit:
+                self.log("WARN", f"{self.name}: instrument reports {reported}, "
+                                 f"but its configured range is in {self.unit}.")
+        return reported
+
+    def refresh_reported_unit(self):
+        """Obtain current unit evidence without trusting profile metadata."""
+        if self._cmd("unit"):
+            return self.read_unit()
+        if self._cmd("sp_read"):
+            self.last_unit_reply = ""
+            self.reported_unit = ""
+            with self.lock:
+                reply = self.link.query(self._cmd("sp_read"))
+            self.last_setpoint_readback_raw = str(reply or "")
+            self._capture_unit(reply)
+        return self.reported_unit
 
     @property
     def effective_unit_token(self):
@@ -132,7 +203,9 @@ class HeatSource:
 
     def format_setpoint_command(self, template, value):
         """Fill {value} and, when required, {unit} in a write template."""
-        out = template.replace("{value}", f"{value:.2f}")
+        # Preserve the configured numeric value instead of hard-rounding every
+        # command to two decimals.  Instrument readback remains authoritative.
+        out = template.replace("{value}", format(float(value), ".12g"))
         if "{unit}" in out:
             token = self.effective_unit_token
             if not token:
@@ -149,7 +222,22 @@ class HeatSource:
         if not cmd:
             return None
         with self.lock:
-            return first_float(self._capture_unit(self.link.query(cmd)))
+            reply = self.link.query(cmd)
+        self.last_setpoint_readback_raw = str(reply or "")
+        token = second_field(reply)
+        token_is_text = False
+        if token:
+            try:
+                float(token)
+            except ValueError:
+                token_is_text = True
+        two_field_reply = len(str(reply or "").split(",")) == 2
+        self.last_setpoint_readback_unit_raw = (
+            token if (plausible_unit_token(token) or token_is_text or
+                      (token and two_field_reply)) else "")
+        value = first_float(self._capture_unit(reply))
+        self.last_setpoint_readback_unit = self.reported_unit
+        return value
 
     def read_temperature(self):
         """The heat source's own block/control sensor (not the reference)."""
@@ -170,6 +258,10 @@ class HeatSource:
             raise RangeError(
                 f"{value:g} {self.unit} is outside {self.name}'s range "
                 f"({lo:g} to {hi:g} {self.unit}). Nothing was sent.")
+        if self.reported_unit and self.reported_unit != self.unit:
+            raise RuntimeError(
+                f"{self.name} reports {self.reported_unit}, but its configured "
+                f"range is in {self.unit}. Nothing was sent.")
         with self.lock:
             if "{unit}" in tmpl and not self.effective_unit_token:
                 # Ask the instrument what unit it wants before writing.
@@ -178,6 +270,7 @@ class HeatSource:
                 except Exception:
                     pass
             command = self.format_setpoint_command(tmpl, value)
+            self.last_setpoint_command = command
             pw = self._cmd("password")
             if send_password and pw:
                 self.link.write(pw)
