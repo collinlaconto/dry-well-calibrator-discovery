@@ -445,6 +445,33 @@ def _parse_datetime_series(series: "pd.Series", _cache={}):
     return _store(best if best_ok >= 0.7 else None)
 
 
+def _is_elapsed_not_clock(series) -> bool:
+    """Decide whether an HH:MM-looking column counts time or tells the time.
+
+    "22:58:35" is a clock reading; "00:05.0" counting up is elapsed time.
+    Both match the same pattern, and reading one as the other shifts every
+    row by hours, so the distinction is made on how the series behaves:
+
+      * any leading field above 23 cannot be an hour -> elapsed
+      * a series that starts at or near zero is counting from a beginning
+      * a series that starts at an arbitrary time of day is a clock
+    """
+    raw = series.dropna().astype(str).str.strip()
+    if len(raw) < 2:
+        return False
+    heads = pd.to_numeric(raw.str.split(":").str[0], errors="coerce").dropna()
+    if heads.empty:
+        return False
+    if (heads > 23).any():
+        return True                      # no hour is 24 or more
+    first = heads.iloc[0]
+    if first == 0:
+        # Starts inside the first hour. Elapsed unless it wraps past midnight,
+        # which a genuine clock series recorded from 00:00 would do.
+        return bool(heads.is_monotonic_increasing)
+    return False                         # starts mid-day: a clock reading
+
+
 def _has_no_date_part(series) -> bool:
     """True if the raw text carries a time but no date.
 
@@ -519,8 +546,9 @@ def detect_time_column(df: "pd.DataFrame"):
     date_only = None
     clock_only = None
     for col in timeish + others:
-        if _looks_like_elapsed(df[col]) and _has_no_date_part(df[col]):
-            continue        # elapsed time; handled below, not as a timestamp
+        if (_looks_like_elapsed(df[col]) and _has_no_date_part(df[col])
+                and _is_elapsed_not_clock(df[col])):
+            continue        # counts time rather than telling it; see step 3
         parsed = _parse_datetime_series(df[col])
         if parsed is not None and parsed.notna().mean() >= 0.7:
             if _is_date_only(parsed):
@@ -539,7 +567,7 @@ def detect_time_column(df: "pd.DataFrame"):
 
     # 3. Elapsed MM:SS column
     for col in timeish + others:
-        if _looks_like_elapsed(df[col]):
+        if _looks_like_elapsed(df[col]) and _is_elapsed_not_clock(df[col]):
             return {"kind": "elapsed", "col": col}
 
     # 4. Fall back to the weaker interpretations, best first.
@@ -591,7 +619,7 @@ def analyze_file(path: str):
     if df.empty:
         return {"df": df, "sheet": sheet, "columns": [], "time_info": None,
                 "time_guess": None, "value_guess": None, "value_options": [],
-                "needs_start": False}
+                "needs_start": False, "unit": None, "unit_source": None}
 
     tinfo = detect_time_column(df)
     if tinfo is None:
@@ -611,11 +639,19 @@ def analyze_file(path: str):
     value_options = [c for c, _ in ranked]
     value_guess = value_options[0] if value_options else None
 
+    unit = unit_from_name(value_guess) if value_guess else None
+    unit_source = "name" if unit else None
+    if unit is None and value_guess is not None and value_guess in df.columns:
+        unit = unit_from_values(df[value_guess])
+        unit_source = "values" if unit else None
+
     return {
         "df": df, "sheet": sheet, "columns": list(df.columns),
         "time_info": tinfo, "time_guess": time_guess,
         "value_guess": value_guess, "value_options": value_options,
         "needs_start": needs_start,
+        "unit": unit,
+        "unit_source": unit_source,
     }
 
 
@@ -665,13 +701,16 @@ def build_series(df: "pd.DataFrame", time_info: dict, value_col: str,
 
 
 def load_any(path: str, start: datetime = None, value_col: str = None,
-             time_col: str = None, log_fn=print) -> "pd.DataFrame":
+             time_col: str = None, log_fn=print, unit: str = None,
+             convert_to: str = "C") -> "pd.DataFrame":
     """
     Universal loader. Reads any file, auto-detects timestamp and temperature
     columns (unless overridden), returns a DataFrame: _abs_time, _value.
 
-    value_col : force a specific temperature column (optional override)
-    time_col  : force a specific timestamp column (optional override)
+    value_col  : force a specific temperature column (optional override)
+    time_col   : force a specific timestamp column (optional override)
+    unit       : force the source unit ('C', 'F', 'K'); detected when None
+    convert_to : unit the returned values are in. None leaves them untouched.
     """
     info = analyze_file(path)
     df = info["df"]
@@ -707,6 +746,17 @@ def load_any(path: str, start: datetime = None, value_col: str = None,
         tdesc = "(none)"
     src = f" [sheet: {info['sheet']}]" if info["sheet"] else ""
     log_fn(f"  time {tdesc}; value '{vcol}'{src}")
+    # Units: convert so everything shares one axis. A Fahrenheit logger drawn
+    # against a Celsius reference looks plausible and is wrong by tens of
+    # degrees, so this is done before anything is plotted or compared.
+    source_unit = unit or info.get("unit")
+    if convert_to and source_unit and source_unit != convert_to:
+        out = convert_series(out, source_unit, convert_to,
+                             log_fn=lambda m: log_fn(
+                                 f"{os.path.basename(path)}: {m}"))
+    elif convert_to and not source_unit:
+        log_fn(f"{os.path.basename(path)}: unit not stated; values used as "
+               f"°{convert_to}. Set it explicitly if that is wrong.")
     return out
 
 
@@ -845,7 +895,82 @@ def run_pipeline(probe_path, start_dt, device_paths, output_path,
 
 
 # ==============================================================================
-# SECTION 7 -- BRIDGE TO CALIBRATION RUNS
+# SECTION 7 -- TEMPERATURE UNITS
+# A Fahrenheit logger plotted against a Celsius reference produces a chart
+# that looks plausible and is wrong by tens of degrees. Units are detected
+# from the column name and, where that is silent, from the values themselves.
+# ==============================================================================
+
+F_NAME = re.compile(r"(?:^|[^a-z])(?:deg\s*f|°\s*f|\bf\b|fahrenheit)(?:[^a-z]|$)",
+                    re.IGNORECASE)
+C_NAME = re.compile(r"(?:^|[^a-z])(?:deg\s*c|°\s*c|\bc\b|celsius|centigrade)"
+                    r"(?:[^a-z]|$)", re.IGNORECASE)
+K_NAME = re.compile(r"(?:^|[^a-z])(?:\bk\b|kelvin)(?:[^a-z]|$)", re.IGNORECASE)
+
+
+# "TempF" and "TempC" have no separator before the unit letter.
+F_SUFFIX = re.compile(r"(?:temp|tmp|te?mperature)\s*_?f\b", re.IGNORECASE)
+C_SUFFIX = re.compile(r"(?:temp|tmp|te?mperature)\s*_?c\b", re.IGNORECASE)
+
+
+def unit_from_name(column: str):
+    """'F', 'C', 'K' or None, read from a column heading."""
+    text = str(column or "")
+    if F_NAME.search(text) or F_SUFFIX.search(text):
+        return "F"
+    if C_NAME.search(text) or C_SUFFIX.search(text):
+        return "C"
+    if K_NAME.search(text):
+        return "K"
+    return None
+
+
+def unit_from_values(values):
+    """Guess a unit from the numbers when the heading does not say.
+
+    Deliberately conservative: only ranges that cannot plausibly be another
+    unit are claimed, and anything ambiguous returns None so the operator is
+    asked rather than guessed at.
+    """
+    if values is None or len(values) == 0:
+        return None
+    numbers = pd.to_numeric(pd.Series(values), errors="coerce").dropna()
+    if len(numbers) < 3:
+        return None
+    low, high = numbers.min(), numbers.max()
+    if low > 200:
+        return "K"          # far above any bench temperature in C or F
+    if low > 50 and high < 250:
+        return "F"          # too warm for ambient C, sensible for F
+    if -60 < low and high < 45:
+        return "C"          # ordinary ambient and bath range in C
+    return None
+
+
+def to_celsius(values, unit):
+    if unit == "F":
+        return (pd.Series(values) - 32.0) * 5.0 / 9.0
+    if unit == "K":
+        return pd.Series(values) - 273.15
+    return pd.Series(values)
+
+
+def convert_series(df, unit, target="C", log_fn=None):
+    """Convert a loaded series into the target unit, in place-ish."""
+    log = log_fn or (lambda m: None)
+    if not unit or unit == target:
+        return df
+    out = df.copy()
+    if target != "C":
+        raise ValueError(f"Only conversion to Celsius is supported, not {target}.")
+    out["_value"] = to_celsius(out["_value"], unit).values
+    log(f"Converted from °{unit} to °C "
+        f"({df['_value'].iloc[0]:.2f} -> {out['_value'].iloc[0]:.2f})")
+    return out
+
+
+# ==============================================================================
+# SECTION 8 -- BRIDGE TO CALIBRATION RUNS
 # A run recorded in this application already holds exactly what the reference
 # probe file provides: timestamped readings from the reference channel. Using
 # it directly removes an export-and-reimport round trip, and guarantees the

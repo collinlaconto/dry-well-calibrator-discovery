@@ -822,12 +822,15 @@ class SuiteApp(tk.Tk):
                        "automatically in almost any export."
                   ).pack(anchor="w", pady=(2, 0))
 
-        if not datasync.HAS_PANDAS:
+        missing = ([] if datasync.HAS_PANDAS else ["pandas"]) + \
+                  ([] if datasync.HAS_PLOTLY else ["plotly"])
+        if missing:
             note = theme.Panel(t)
             note.pack(fill="x", padx=18, pady=8)
             ttk.Label(note.inner, style="Card.TLabel", justify="left",
                       wraplength=760,
-                      text="This tool needs two extra libraries:\n\n"
+                      text=f"This tool needs {' and '.join(missing)}, which "
+                           "are not installed:\n\n"
                            "    pip install pandas plotly openpyxl\n\n"
                            "Install them and restart. Everything else in the "
                            "application works without them."
@@ -863,10 +866,18 @@ class SuiteApp(tk.Tk):
         self.lbl_probe_cols = ttk.Label(ref, style="Dim.TLabel", text="")
         self.lbl_probe_cols.grid(row=2, column=0, columnspan=3, sticky="w",
                                  padx=6, pady=(0, 4))
-        self.lbl_start = ttk.Label(ref, style="Dim.TLabel",
-                                   text="Start time (YYYY-MM-DD HH:MM:SS)")
+        # Always present: a logger can use elapsed time even when the
+        # reference does not, and there was previously no way to say when it
+        # started.
+        ttk.Label(ref, text="Start time for elapsed-time files").grid(
+            row=3, column=0, sticky="e", **pad)
         self.var_start = tk.StringVar()
-        self.ent_start = ttk.Entry(ref, textvariable=self.var_start, width=24)
+        ttk.Entry(ref, textvariable=self.var_start, width=24).grid(
+            row=3, column=1, sticky="w", **pad)
+        ttk.Label(ref, style="Dim.TLabel",
+                  text="YYYY-MM-DD HH:MM:SS — needed only by files that record "
+                       "elapsed time rather than timestamps").grid(
+            row=4, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6))
 
         # --- loggers -------------------------------------------------------
         dev = ttk.LabelFrame(t, text="Data loggers")
@@ -879,12 +890,12 @@ class SuiteApp(tk.Tk):
                      command=self._remove_logger).pack(side="left", padx=8)
         theme.Button(bar, text="Clear",
                      command=self._clear_loggers).pack(side="left")
-        cols = ("file", "time", "value", "rows")
+        cols = ("file", "time", "value", "unit", "rows")
         self.tbl_loggers = ttk.Treeview(dev, columns=cols, show="headings",
                                         height=6)
-        for c, w, txt in (("file", 280, "File"), ("time", 200, "Time column"),
-                          ("value", 200, "Temperature column"),
-                          ("rows", 90, "Rows")):
+        for c, w, txt in (("file", 240, "File"), ("time", 175, "Time column"),
+                          ("value", 175, "Temperature column"),
+                          ("unit", 95, "Unit"), ("rows", 80, "Rows")):
             self.tbl_loggers.heading(c, text=txt)
             self.tbl_loggers.column(c, width=w, anchor="w")
         self.tbl_loggers.pack(fill="both", expand=True, padx=6, pady=(0, 6))
@@ -904,13 +915,19 @@ class SuiteApp(tk.Tk):
         self.cbo_log_value = ttk.Combobox(edit, textvariable=self.var_log_value,
                                           width=22, state="readonly")
         self.cbo_log_value.pack(side="left", padx=4)
+        ttk.Label(edit, text="Unit").pack(side="left", padx=(12, 0))
+        self.var_log_unit = tk.StringVar()
+        ttk.Combobox(edit, textvariable=self.var_log_unit, width=12,
+                     state="readonly",
+                     values=["auto", "°C", "°F", "K"]).pack(side="left", padx=4)
         theme.Button(edit, text="Apply to selected",
                      command=self._apply_logger_columns).pack(side="left",
                                                               padx=8)
         ttk.Label(dev, style="Dim.TLabel", wraplength=880, justify="left",
-                  text="Columns are detected automatically; override them here "
-                       "if a file is unusual. Loggers are trimmed to the "
-                       "reference's time window before charting."
+                  text="Columns and units are detected automatically; override "
+                       "them here if a file is unusual. Everything is converted "
+                       "to °C and trimmed to the reference's time window before "
+                       "charting."
                   ).pack(anchor="w", padx=8, pady=(0, 6))
 
         # --- output --------------------------------------------------------
@@ -928,12 +945,7 @@ class SuiteApp(tk.Tk):
         self.cbo_cmp_run.configure(state="readonly" if from_run else "disabled")
         self.ent_probe.configure(state="disabled" if from_run else "normal")
         if from_run:
-            self.lbl_start.grid_remove()
-            self.ent_start.grid_remove()
             self._refresh_compare_runs()
-        elif getattr(self, "_probe_needs_start", False):
-            self.lbl_start.grid(row=3, column=0, sticky="e", padx=6, pady=4)
-            self.ent_start.grid(row=3, column=1, sticky="w", padx=6, pady=4)
 
     def _refresh_compare_runs(self):
         labels = []
@@ -964,11 +976,16 @@ class SuiteApp(tk.Tk):
             return
         self._probe_info = info
         self._probe_needs_start = info["needs_start"]
+        unit = info.get("unit")
         self.lbl_probe_cols.configure(
             text=f"Detected time '{info['time_guess']}', temperature "
-                 f"'{info['value_guess']}'"
+                 f"'{info['value_guess']}', unit "
+                 f"{self._unit_text(unit, info.get('unit_source'))}"
             + ("  ·  this file uses elapsed time, so a start time is needed"
                if info["needs_start"] else ""))
+        if unit == "F":
+            self._log("WARN", f"{os.path.basename(path)} is in °F — it will be "
+                              "converted to °C.")
         self._sync_compare_source()
 
     def _add_logger_files(self):
@@ -984,17 +1001,35 @@ class SuiteApp(tk.Tk):
             except Exception as e:
                 self._log("FAIL", f"{os.path.basename(path)}: {e}")
                 continue
+            unit = info.get("unit")
             iid = self.tbl_loggers.insert(
                 "", "end",
                 values=(os.path.basename(path),
                         info["time_guess"] or "(not found)",
                         info["value_guess"] or "(not found)",
+                        self._unit_text(unit, info.get("unit_source")),
                         len(info["df"])))
             self.logger_files[iid] = {"path": path, "info": info,
-                                      "time": None, "value": None}
+                                      "time": None, "value": None,
+                                      "unit": None}
             self._log("INFO", f"{os.path.basename(path)}: time "
                               f"'{info['time_guess']}', temperature "
-                              f"'{info['value_guess']}'")
+                              f"'{info['value_guess']}', unit "
+                              f"{unit or 'not stated'}")
+            if unit == "F":
+                self._log("WARN", f"{os.path.basename(path)} is in °F — it "
+                                  "will be converted to °C before charting.")
+            elif not unit:
+                self._log("WARN", f"{os.path.basename(path)}: no unit could be "
+                                  "determined; values will be treated as °C. "
+                                  "Set it in the Unit box if that is wrong.")
+
+    @staticmethod
+    def _unit_text(unit, source):
+        if not unit:
+            return "assumed °C"
+        label = {"C": "°C", "F": "°F", "K": "K"}.get(unit, unit)
+        return label if source == "name" else f"{label} (guess)"
 
     def _selected_logger(self):
         sel = self.tbl_loggers.selection()
@@ -1013,6 +1048,9 @@ class SuiteApp(tk.Tk):
         self.cbo_log_value["values"] = info["value_options"] or info["columns"]
         self.var_log_time.set(entry["time"] or guess or "")
         self.var_log_value.set(entry["value"] or info["value_guess"] or "")
+        chosen = entry.get("unit")
+        self.var_log_unit.set({"C": "°C", "F": "°F", "K": "K"}.get(chosen,
+                                                                   "auto"))
 
     def _apply_logger_columns(self):
         sel = self.tbl_loggers.selection()
@@ -1023,11 +1061,24 @@ class SuiteApp(tk.Tk):
             return
         entry["time"] = self.var_log_time.get().strip() or None
         entry["value"] = self.var_log_value.get().strip() or None
+        picked = self.var_log_unit.get()
+        entry["unit"] = {"°C": "C", "°F": "F", "K": "K"}.get(picked)
+        # A different temperature column may well be in a different unit.
+        info = entry["info"]
+        shown_unit, source = entry["unit"], "name"
+        if shown_unit is None:
+            column = entry["value"] or info.get("value_guess")
+            shown_unit = datasync.unit_from_name(column) if column else None
+            source = "name" if shown_unit else None
+            if shown_unit is None and column in info["df"].columns:
+                shown_unit = datasync.unit_from_values(info["df"][column])
+                source = "values" if shown_unit else None
         self.tbl_loggers.item(
             sel[0], values=(os.path.basename(entry["path"]),
-                            entry["time"] or entry["info"]["time_guess"],
-                            entry["value"] or entry["info"]["value_guess"],
-                            len(entry["info"]["df"])))
+                            entry["time"] or info["time_guess"],
+                            entry["value"] or info["value_guess"],
+                            self._unit_text(shown_unit, source),
+                            len(info["df"])))
 
     def _remove_logger(self):
         for iid in self.tbl_loggers.selection():
@@ -1040,16 +1091,19 @@ class SuiteApp(tk.Tk):
         self.logger_files.clear()
 
     def _build_comparison(self):
-        if not self.logger_files:
-            messagebox.showinfo("Nothing to compare",
-                                "Add at least one logger file.")
-            return
         from_run = self.var_ref_source.get() == "run"
+        has_reference = (bool(self.var_cmp_run.get()) if from_run
+                         else bool(self.var_probe_path.get().strip()))
+        if not self.logger_files and not has_reference:
+            messagebox.showinfo(
+                "Nothing to chart",
+                "Choose a reference, some logger files, or both.")
+            return
         probe_series = None
         probe_path = None
         start = None
 
-        if from_run:
+        if from_run and self.var_cmp_run.get():
             label = self.var_cmp_run.get()
             engine = next((e for rid, e in self.engines.items()
                            if f"({rid})" in label), None)
@@ -1070,29 +1124,26 @@ class SuiteApp(tk.Tk):
                     "The selected run recorded no samples on its reference "
                     "channel.")
                 return
-        else:
+        elif not from_run:
             probe_path = self.var_probe_path.get().strip()
-            if not probe_path:
-                messagebox.showerror("No reference",
-                                     "Choose a probe file, or use a "
-                                     "calibration run.")
-                return
-            if getattr(self, "_probe_needs_start", False):
-                text = self.var_start.get().strip()
-                if not text:
+            if probe_path and getattr(self, "_probe_needs_start", False):
+                if not self.var_start.get().strip():
                     messagebox.showerror(
                         "Start time needed",
                         "This probe file records elapsed time, so it needs a "
                         "start date and time (YYYY-MM-DD HH:MM:SS).")
                     return
-                try:
-                    start = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
-                except ValueError:
-                    messagebox.showerror(
-                        "Start time not understood",
-                        "Use the format YYYY-MM-DD HH:MM:SS, for example "
-                        "2026-05-21 22:58:35.")
-                    return
+
+        text = self.var_start.get().strip()
+        if text:
+            try:
+                start = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                messagebox.showerror(
+                    "Start time not understood",
+                    "Use the format YYYY-MM-DD HH:MM:SS, for example "
+                    "2026-05-21 22:58:35.")
+                return
 
         output = filedialog.asksaveasfilename(
             title="Save the chart", defaultextension=".html",
@@ -1116,7 +1167,7 @@ class SuiteApp(tk.Tk):
     def _compare_worker(self, probe_series, probe_path, start, output):
         log = lambda message: self._log("INFO", message)
         try:
-            if probe_series is None:
+            if probe_series is None and probe_path:
                 probe_series = datasync.load_any(probe_path, start=start,
                                                  log_fn=log)
             frames, names = [], []
@@ -1125,7 +1176,8 @@ class SuiteApp(tk.Tk):
                 log(f"Loading {name}")
                 frames.append(datasync.load_any(
                     entry["path"], start=start, value_col=entry["value"],
-                    time_col=entry["time"], log_fn=log))
+                    time_col=entry["time"], log_fn=log,
+                    unit=entry.get("unit")))
                 names.append(name)
             if probe_series is not None and not probe_series.empty:
                 first = probe_series["_abs_time"].min()

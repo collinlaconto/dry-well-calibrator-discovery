@@ -91,13 +91,21 @@ plausible °C range, so humidity, pressure and resistance columns are rejected.
 Metadata preambles and summary blocks above the real header are skipped
 automatically. Every guess is shown and can be overridden.
 
+**Units are handled.** Each file's unit is read from its column heading, or
+guessed from the values when the heading is silent, and everything is
+converted to °C before charting — a °F logger drawn against a °C reference
+would otherwise look plausible and be wrong by tens of degrees. The detected
+unit is shown per file and can be overridden.
+
 **The reference can be a calibration run from this application**, which skips
 an export-and-reimport round trip and guarantees the comparison is against the
 same readings the results were built from. A probe file works too; if it
 records elapsed time, you will be asked for the start time.
 
 Loggers are trimmed to the reference's time window, and anything that does not
-overlap it is called out rather than silently plotted. Output is a
+overlap it is called out rather than silently plotted. A reference alone, or
+loggers alone, can be charted too. Files recording elapsed time need a start
+time, which applies to the reference and the loggers alike. Output is a
 self-contained interactive HTML chart.
 
 Needs `pandas`, `plotly` and `openpyxl`. Without them this page explains what
