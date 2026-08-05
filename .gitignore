@@ -1,0 +1,45 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments and local environment variables
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Packaging output
+build/
+dist/
+*.egg-info/
+
+# Calibration Suite local device/profile state
+/heat_source_profiles.json
+/calibration_profiles.json
+
+# Generated calibration and comparison output
+/exports/
+*_summary.csv
+*_samples.csv
+logger_comparison.html
+
+# Logs and temporary files
+*.log
+*.tmp
+~$*
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
