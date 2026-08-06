@@ -311,11 +311,14 @@ that something was interrupted.
 **Read channels every** on the Instruments tab (1 / 2 / 5 / 10 s) sets how
 often the 286 is queried. The application never requests readings faster than
 the device's configured one-second scan. It requests the ADT286's own
-millisecond acquisition timestamp with every frame; a missing or repeated
-device timestamp is withheld rather than assigned a new software sample. The
-reply timeout is measured from the most recently received bytes, so a large
-multi-channel timestamped frame is not cut off merely because its total serial
-transfer takes more than two seconds.
+millisecond acquisition timestamp with every frame. When the firmware returns
+it, a repeated timestamp is withheld rather than assigned a new software
+sample. Some ADT286 firmware omits this optional field even when requested; in
+that case the complete device readings are retained, the device-time field is
+left blank, and host receipt time is stored separately rather than fabricated
+as device time. The reply timeout is measured from the most recently received
+bytes, so a large multi-channel frame is not cut off merely because its total
+serial transfer takes more than two seconds.
 
 There's a coupling worth knowing: stability needs **at least three readings
 inside the window**, so a window shorter than three read intervals can never

@@ -56,9 +56,11 @@ class Reading:
 
     ``timestamp`` and ``monotonic`` are host receipt metadata.
     ``device_timestamp`` is the exact acquisition-time token requested from
-    the ADT286 and is used to prove that a poll represents a new scan.  Numeric
-    tokens reported by the device are retained separately so raw exports do
-    not lose resolution through display formatting.
+    the ADT286 when its firmware supplies that optional field.  It remains
+    empty when omitted; host receipt time is retained separately and is never
+    presented as device time.  Numeric tokens reported by the device are kept
+    separately so raw exports do not lose resolution through display
+    formatting.
     """
 
     channel: str
@@ -284,7 +286,7 @@ class Adt286:
                 # The command set specifies the quoted/semicolon scan body
                 # but does not mandate a wire terminator.  Accept an idle-
                 # completed body; poll_once still requires every subscribed
-                # channel and its device timestamp before publishing it.
+                # channel before publishing a complete frame.
                 require_reply_terminator=False, max_reply_time=30.0)
             self.link.open(t)
             self.idn = self.link.query("*IDN?")
@@ -488,10 +490,12 @@ class Adt286:
         if self.link is None or not self.link.is_open or not requested:
             return 0
         with self.lock:
-            # Request the device timestamp and also avoid querying faster than
-            # the configured scan period.  A software cycle is assigned only
-            # after every required channel reports a timestamp newer than its
-            # last accepted device acquisition.
+            # Request Additel's optional device timestamp and avoid querying
+            # faster than the configured scan period.  Firmware that supplies
+            # timestamps gets physical-scan de-duplication.  Firmware that
+            # omits the optional field still publishes the exact device values
+            # with an honestly blank device_timestamp and separate host receipt
+            # metadata.
             started = time.monotonic()
             if started - self._last_poll_started < self.minimum_poll_interval:
                 return 0
@@ -520,44 +524,52 @@ class Adt286:
             missing_device_times = [
                 c for c in requested
                 if not data[c].get("device_timestamp")]
-            if missing_device_times:
-                for channel in requested:
-                    self._readings.pop(channel, None)
-                if self.freshness_supported is not False:
-                    self.log(
-                        "FAIL", "The ADT286 did not return device timestamps "
-                        "for SCAN:DATA:Last? 1. Calibration readings are "
-                        "withheld because a fresh physical scan cannot be "
-                        "proved.")
-                self.freshness_supported = False
-                self.last_error = "ADT286 device timestamps are unavailable"
-                self._note_bad_poll(
-                    "device acquisition timestamps were absent for "
-                    + ", ".join(missing_device_times))
-                return 0
-            self.freshness_supported = True
-            repeated_times = [
-                c for c in requested
-                if self._last_device_times.get(c) ==
-                data[c].get("device_timestamp")]
-            if repeated_times:
-                self._note_bad_poll(
-                    "the device acquisition timestamp did not advance for "
-                    + ", ".join(repeated_times))
-                return 0
             unusable = [c for c in requested
                         if c not in data or data[c]["temperature"] is None]
             if unusable:
-                # The scan is running but no longer covers what we asked for.
+                # A calibration frame is atomic: never publish the valid
+                # subset when any requested channel is unusable.  Otherwise a
+                # reference-only consumer could count an old/partial physical
+                # scan while the DUT evidence for that cycle is absent.
                 self._note_bad_poll(
                     f"{len(unusable)} subscribed channel(s) missing or invalid "
                     "in the scan")
-                if len(unusable) == len(requested):
-                    for channel in requested:
-                        self._readings.pop(channel, None)
-                    return 0
+                for channel in requested:
+                    self._readings.pop(channel, None)
+                return 0
             else:
+                # Only a complete, usable frame may change timestamp mode or
+                # freshness history.  A rejected frame must never erase the
+                # evidence needed to identify an old timestamped frame later.
+                if missing_device_times:
+                    for channel in requested:
+                        self._last_device_times.pop(channel, None)
+                    if self.freshness_supported is not False:
+                        self.log(
+                            "WARN", "This ADT286 firmware omitted the optional "
+                            "device timestamp from SCAN:DATA:Last? 1. Complete "
+                            "device readings will be recorded; device-time "
+                            "fields remain blank and host receipt time is kept "
+                            "separately."
+                        )
+                    self.freshness_supported = False
+                else:
+                    if self.freshness_supported is False:
+                        self.log(
+                            "INFO", "ADT286 device timestamps are available "
+                            "again; physical-scan de-duplication resumed.")
+                    self.freshness_supported = True
+                    repeated_times = [
+                        c for c in requested
+                        if self._last_device_times.get(c) ==
+                        data[c].get("device_timestamp")]
+                    if repeated_times:
+                        self._note_bad_poll(
+                            "the device acquisition timestamp did not advance "
+                            "for " + ", ".join(repeated_times))
+                        return 0
                 self._bad_polls = 0
+                self.last_error = ""
             self._cycle += 1
             now = time.time()
             acquired = time.monotonic()
@@ -579,8 +591,10 @@ class Adt286:
                     raw_temperature=vals["raw_temperature"],
                     raw_electrical=vals["raw_electrical"],
                 )
-            self._last_device_times.update(
-                {name: data[name]["device_timestamp"] for name in requested})
+            if self.freshness_supported:
+                self._last_device_times.update(
+                    {name: data[name]["device_timestamp"]
+                     for name in requested})
             reported_units = {data[c]["unit"] for c in requested
                               if c in data and data[c]["temperature"] is not None
                               and data[c]["unit"]}
@@ -636,6 +650,8 @@ class Adt286:
         if self._bad_polls:
             return f"no data for {self._bad_polls} poll(s) - recovering"
         base = "scanning"
+        if self.freshness_supported is False:
+            base += " (device time unavailable; host receipt time retained)"
         if self.recoveries:
             base += f" (recovered {self.recoveries}x)"
         return base

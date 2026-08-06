@@ -79,6 +79,42 @@ class SeriesClosureTests(unittest.TestCase):
 
 
 class ExportClosureTests(unittest.TestCase):
+    def test_timestamp_omission_exports_blank_device_time_and_host_receipt(self):
+        def add_timestamp_free_sample(result):
+            result.source_checks = ()
+            result.stability_samples = ()
+            result.samples = (
+                MappingProxyType({
+                    "t": 1_700_000_000.123456,
+                    "device_timestamp": "",
+                    "device_timestamps": MappingProxyType({"DUT": ""}),
+                    "cycle": 7,
+                    "source": "ADT286 SCAN:DATA:Last? 1",
+                    "ref": 20.0,
+                    "ref_raw": "20.000000000000000001",
+                    "duts": MappingProxyType({"DUT": 20.1}),
+                    "duts_raw": MappingProxyType({
+                        "DUT": "20.100000000000000001",
+                    }),
+                }),
+            )
+
+        engine, adt = export_fixture(add_timestamp_free_sample)
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "timestamp-free.csv"
+            write_samples(engine, adt, str(path))
+            rows = read_csv(path)
+
+        header, data = table_after_header(rows, "Phase")
+        row = next(item for item in data if item[header.index("Phase")]
+                   == "sampling")
+        self.assertEqual(row[header.index("Device acquisition time")], "")
+        self.assertEqual(row[header.index("DUT device acquisition time")], "")
+        self.assertNotEqual(row[header.index("Host receipt time")], "")
+        self.assertEqual(row[header.index(f"Reference ({DEG_C})")],
+                         "20.000000000000000001")
+
     def test_raw_export_never_reconstructs_missing_device_tokens(self):
         source_checks = (
             MappingProxyType({

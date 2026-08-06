@@ -88,7 +88,9 @@ def _metadata_rows(engine, adt):
          evidence.get("acquisition_command", "SCAN:DATA:Last? 1")],
         ["Data policy",
          "Device values retained uncorrected; mean, sample SD, error and "
-         "verdict are derived separately"],
+         "verdict are derived separately. Device-time cells remain blank "
+         "when firmware omits that optional field; host time is receipt "
+         "metadata only"],
         [],
         ["Reference channel", p.get("reference_channel", "")],
         ["DUT channels", ", ".join(p.get("dut_channels", []))],

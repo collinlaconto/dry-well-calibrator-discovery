@@ -62,12 +62,14 @@ class SequenceLink:
     def __init__(self, payloads):
         self.payloads = list(payloads)
         self.queries = []
+        self.writes = []
 
     def query(self, command):
         self.queries.append(command)
         return self.payloads.pop(0)
 
     def write(self, command):
+        self.writes.append(command)
         return None
 
 
@@ -119,20 +121,117 @@ class DeviceTimestampTests(unittest.TestCase):
             ["SCAN:DATA:Last? 1", "SCAN:DATA:Last? 1", "SCAN:DATA:Last? 1"],
         )
 
-    def test_reply_without_authoritative_device_timestamp_is_not_published(self):
+    def test_optional_timestamp_omission_keeps_exact_device_values(self):
+        messages = []
         link = SequenceLink([
-            scan_group("REF", "20.0") + ";" + scan_group("DUT", "20.1")
+            scan_group("REF", "20.000000000000000001") + ";"
+            + scan_group("DUT", "20.100000000000000001")
         ])
+        adt = Adt286(logger=lambda tag, message: messages.append((tag, message)))
+        adt.link = link
+        adt._subs = {"run": ["REF", "DUT"]}
+        adt._last_device_times = {
+            "REF": "2026:08:05 17:04:02 000",
+            "DUT": "2026:08:05 17:04:02 000",
+        }
+        adt._last_poll_started = -1e9
+
+        self.assertEqual(adt.poll_once(), 2)
+        self.assertEqual(adt.cycle, 1)
+        self.assertEqual(adt.latest("REF").raw_temperature,
+                         "20.000000000000000001")
+        self.assertEqual(adt.latest("DUT").raw_temperature,
+                         "20.100000000000000001")
+        self.assertEqual(adt.latest("REF").device_timestamp, "")
+        self.assertEqual(adt.latest("DUT").device_timestamp, "")
+        self.assertGreater(adt.latest("REF").timestamp, 0)
+        self.assertFalse(adt.freshness_supported)
+        self.assertEqual(adt._last_device_times, {})
+        self.assertEqual(adt._bad_polls, 0)
+        self.assertEqual(adt.recoveries, 0)
+        timestamp_warnings = [
+            message for tag, message in messages
+            if tag == "WARN" and "optional device timestamp" in message
+        ]
+        self.assertEqual(len(timestamp_warnings), 1)
+        self.assertEqual(link.queries, ["SCAN:DATA:Last? 1"])
+
+    def test_timestamp_free_firmware_advances_only_software_cycle_metadata(self):
+        messages = []
+        unchanged_payload = (
+            scan_group("REF", "20.0") + ";" + scan_group("DUT", "20.1")
+        )
+        link = SequenceLink([unchanged_payload, unchanged_payload])
+        adt = Adt286(
+            logger=lambda tag, message: messages.append((tag, message)))
+        adt.link = link
+        adt._subs = {"run": ["REF", "DUT"]}
+
+        adt._last_poll_started = -1e9
+        self.assertEqual(adt.poll_once(), 2)
+        adt._last_poll_started = -1e9
+        self.assertEqual(adt.poll_once(), 2)
+
+        self.assertEqual(adt.cycle, 2)
+        self.assertEqual(adt.latest("REF").raw_temperature, "20.0")
+        self.assertEqual(adt.latest("REF").device_timestamp, "")
+        self.assertEqual(adt._last_device_times, {})
+        self.assertEqual(adt._bad_polls, 0)
+        self.assertEqual(adt.recoveries, 0)
+        self.assertEqual(link.writes, [])
+        self.assertEqual(sum(
+            tag == "WARN" and "optional device timestamp" in message
+            for tag, message in messages
+        ), 1)
+
+    def test_rejected_timestamp_free_frame_cannot_make_old_device_time_fresh(self):
+        stamp = "2026:08:05 17:04:03 123"
+        accepted = timestamped_payload(stamp, "20.0", "20.1")
+        rejected = (
+            scan_group("REF", "NaN") + ";" + scan_group("DUT", "NaN")
+        )
+        link = SequenceLink([accepted, rejected, accepted])
         adt = Adt286()
         adt.link = link
         adt._subs = {"run": ["REF", "DUT"]}
-        adt._last_poll_started = -1e9
 
+        adt._last_poll_started = -1e9
+        self.assertEqual(adt.poll_once(), 2)
+        self.assertEqual(adt.cycle, 1)
+
+        adt._last_poll_started = -1e9
         self.assertEqual(adt.poll_once(), 0)
-        self.assertEqual(adt.cycle, 0)
+        self.assertEqual(adt.cycle, 1)
+        self.assertTrue(adt.freshness_supported)
+        self.assertEqual(adt._last_device_times,
+                         {"REF": stamp, "DUT": stamp})
+
+        adt._last_poll_started = -1e9
+        self.assertEqual(adt.poll_once(), 0)
+        self.assertEqual(adt.cycle, 1)
+        self.assertEqual(adt._last_device_times,
+                         {"REF": stamp, "DUT": stamp})
+
+    def test_partial_repeated_frame_cannot_publish_reference_only_cycle(self):
+        stamp = "2026:08:05 17:04:03 123"
+        accepted = timestamped_payload(stamp, "20.0", "20.1")
+        partial = timestamped_payload(stamp, "20.0", "NaN")
+        link = SequenceLink([accepted, partial])
+        adt = Adt286()
+        adt.link = link
+        adt._subs = {"run": ["REF", "DUT"]}
+
+        adt._last_poll_started = -1e9
+        self.assertEqual(adt.poll_once(), 2)
+        self.assertEqual(adt.cycle, 1)
+
+        adt._last_poll_started = -1e9
+        self.assertEqual(adt.poll_once(), 0)
+        self.assertEqual(adt.cycle, 1)
         self.assertIsNone(adt.latest("REF"))
         self.assertIsNone(adt.latest("DUT"))
-        self.assertEqual(link.queries, ["SCAN:DATA:Last? 1"])
+        self.assertEqual(adt._last_device_times,
+                         {"REF": stamp, "DUT": stamp})
 
     def test_raw_sample_preserves_host_and_device_timestamps(self):
         stamp = "2026:08:05 17:04:03 123"

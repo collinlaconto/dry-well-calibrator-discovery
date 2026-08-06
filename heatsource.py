@@ -242,7 +242,24 @@ class HeatSource:
     def refresh_reported_unit(self):
         """Obtain current unit evidence without trusting profile metadata."""
         if self._cmd("unit"):
-            return self.read_unit()
+            # The activity log showed one empty network reply immediately
+            # after output-enable, followed by normal replies on retry.  Make
+            # one fresh read-only retry for an empty/failed exchange.  Never
+            # reuse cached unit evidence, and never hide a non-empty but
+            # unrecognised/conflicting device reply behind a retry.
+            for attempt in range(2):
+                try:
+                    reported = self.read_unit()
+                except Exception:
+                    if attempt:
+                        raise
+                    time.sleep(0.1)
+                    continue
+                if reported or self.last_unit_reply:
+                    return reported
+                if not attempt:
+                    time.sleep(0.1)
+            return ""
         if self._cmd("sp_read"):
             self.last_unit_reply = ""
             self.reported_unit = ""

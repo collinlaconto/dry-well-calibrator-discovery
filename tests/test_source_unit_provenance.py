@@ -94,6 +94,19 @@ class UnitReplyLink:
         return self.reply
 
 
+class SequenceUnitReplyLink(UnitReplyLink):
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.queries = 0
+
+    def query(self, _command):
+        self.queries += 1
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
 def source_engine(link):
     source = HeatSource({
         "name": "Conflicting well",
@@ -127,6 +140,51 @@ def conflicting_engine():
 
 
 class SourceUnitProvenanceTests(unittest.TestCase):
+    def test_empty_live_unit_reply_gets_one_fresh_device_retry(self):
+        source = HeatSource({
+            "name": "Retry well", "range_unit": DEG_C,
+            "range_min": -100.0, "range_max": 200.0,
+            "unit": "UNIT?",
+        })
+        source.link = SequenceUnitReplyLink(["", "  C,1001"])
+
+        with patch("calsuite.heatsource.time.sleep", return_value=None):
+            reported = source.refresh_reported_unit()
+
+        self.assertEqual(reported, DEG_C)
+        self.assertEqual(source.last_unit_reply, "  C,1001")
+        self.assertEqual(source.link.queries, 2)
+
+    def test_failed_live_unit_exchange_gets_one_fresh_device_retry(self):
+        source = HeatSource({
+            "name": "Retry well", "range_unit": DEG_C,
+            "range_min": -100.0, "range_max": 200.0,
+            "unit": "UNIT?",
+        })
+        source.link = SequenceUnitReplyLink([
+            TimeoutError("first reply timed out"), "1001",
+        ])
+
+        with patch("calsuite.heatsource.time.sleep", return_value=None):
+            reported = source.refresh_reported_unit()
+
+        self.assertEqual(reported, DEG_C)
+        self.assertEqual(source.last_unit_reply, "1001")
+        self.assertEqual(source.link.queries, 2)
+
+    def test_nonempty_unknown_unit_is_not_hidden_by_retry(self):
+        source = HeatSource({
+            "name": "Unknown unit well", "range_unit": DEG_C,
+            "range_min": -100.0, "range_max": 200.0,
+            "unit": "UNIT?",
+        })
+        source.link = SequenceUnitReplyLink(["BANANA", "1001"])
+
+        self.assertEqual(source.refresh_reported_unit(), "")
+
+        self.assertEqual(source.last_unit_reply, "BANANA")
+        self.assertEqual(source.link.queries, 1)
+
     def test_conflicting_exact_reply_unit_fails_and_is_preserved(self):
         engine, source = conflicting_engine()
 
