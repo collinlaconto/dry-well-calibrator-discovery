@@ -92,19 +92,26 @@ def parse_scan_data(payload):
     all_device_times = DEVICE_TIME_RE.findall(clean_payload)
     shared_device_time = (all_device_times[0]
                           if len(set(all_device_times)) == 1 else "")
+    parsed_order = []
     for group in clean_payload.split(";"):
         group = group.strip()
         if not group:
             continue
-        device_time = ""
+        group_device_times = DEVICE_TIME_RE.findall(group)
+        device_time = (group_device_times[0]
+                       if len(set(group_device_times)) == 1 else "")
         fields = []
         for raw_field in group.split(","):
             field = raw_field.strip().strip('"')
-            match = DEVICE_TIME_RE.search(field)
-            if match:
-                device_time = match.group(0)
-                continue
-            fields.append(field)
+            # Additel documents the timestamp format, but does not promise
+            # that it occupies its own comma-delimited field.  Some firmware
+            # places it directly against the opening/closing quote or the
+            # first/last data token.  Remove only the time substring so an
+            # adjacent channel name or measurement is never discarded.
+            carried_device_time = DEVICE_TIME_RE.search(field) is not None
+            field = DEVICE_TIME_RE.sub("", field).strip().strip('"').strip()
+            if field or not carried_device_time:
+                fields.append(field)
         device_time = device_time or shared_device_time
         f = fields
         if len(f) < 3 or not f[0]:
@@ -144,6 +151,16 @@ def parse_scan_data(payload):
                      "raw_temperature": raw_temp,
                      "raw_electrical": raw_elec,
                      "device_timestamp": device_time}
+        parsed_order.append(name)
+
+    # A single time token applies to the whole returned scan.  If firmware
+    # returns one timestamp per channel outside the channel's comma fields,
+    # preserve the documented response order rather than withholding an
+    # otherwise complete device frame.
+    if (not shared_device_time and len(all_device_times) == len(parsed_order)):
+        for name, device_time in zip(parsed_order, all_device_times):
+            if not out[name]["device_timestamp"]:
+                out[name]["device_timestamp"] = device_time
     return out
 
 
@@ -262,7 +279,13 @@ class Adt286:
         if not target_is_set(t):
             raise RuntimeError("No port or address given for the ADT286.")
         with self.lock:
-            self.link = make_link(t, terminator="\r\n", reply_timeout=2.0)
+            self.link = make_link(
+                t, terminator="\r\n", reply_timeout=2.0,
+                # The command set specifies the quoted/semicolon scan body
+                # but does not mandate a wire terminator.  Accept an idle-
+                # completed body; poll_once still requires every subscribed
+                # channel and its device timestamp before publishing it.
+                require_reply_terminator=False, max_reply_time=30.0)
             self.link.open(t)
             self.idn = self.link.query("*IDN?")
             if not self.idn:
@@ -483,9 +506,20 @@ class Adt286:
             if not data:
                 self._note_bad_poll("no readings came back")
                 return 0
+            missing_channels = [c for c in requested if c not in data]
+            if missing_channels:
+                for channel in requested:
+                    self._readings.pop(channel, None)
+                self.last_error = (
+                    "ADT286 returned an incomplete scan frame; missing "
+                    + ", ".join(missing_channels))
+                self._note_bad_poll(
+                    "an incomplete response omitted "
+                    + ", ".join(missing_channels))
+                return 0
             missing_device_times = [
                 c for c in requested
-                if c not in data or not data[c].get("device_timestamp")]
+                if not data[c].get("device_timestamp")]
             if missing_device_times:
                 for channel in requested:
                     self._readings.pop(channel, None)
@@ -497,6 +531,9 @@ class Adt286:
                         "proved.")
                 self.freshness_supported = False
                 self.last_error = "ADT286 device timestamps are unavailable"
+                self._note_bad_poll(
+                    "device acquisition timestamps were absent for "
+                    + ", ".join(missing_device_times))
                 return 0
             self.freshness_supported = True
             repeated_times = [

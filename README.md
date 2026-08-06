@@ -206,8 +206,9 @@ Two details it handles for you:
 - **Verification by error queue.** A write command returns nothing, so its
   reply proves nothing. Where an instrument keeps an error queue, each
   candidate is confirmed with `SYSTem:ERRor?` — `0` means accepted, `-110`
-  means the header wasn't recognised. Instruments without an error queue fall
-  back to judging by replies.
+  means the header wasn't recognised. The queue is cleared immediately before
+  each checked command, so an older error cannot be blamed on a later command.
+  Instruments without an error queue fall back to judging by replies.
 - **Set points that need a unit.** Additel wells report the set point as value
   *and* unit (`60.0000,1001`) and require the unit back on a write; sent
   without it they answer `-109 Missing parameter` and nothing changes. The
@@ -311,7 +312,10 @@ that something was interrupted.
 often the 286 is queried. The application never requests readings faster than
 the device's configured one-second scan. It requests the ADT286's own
 millisecond acquisition timestamp with every frame; a missing or repeated
-device timestamp is withheld rather than assigned a new software sample.
+device timestamp is withheld rather than assigned a new software sample. The
+reply timeout is measured from the most recently received bytes, so a large
+multi-channel timestamped frame is not cut off merely because its total serial
+transfer takes more than two seconds.
 
 There's a coupling worth knowing: stability needs **at least three readings
 inside the window**, so a window shorter than three read intervals can never

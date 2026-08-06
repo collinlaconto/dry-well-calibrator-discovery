@@ -23,6 +23,64 @@ class RangeError(ValueError):
     """Raised when a set point falls outside the profile's declared range."""
 
 
+def error_code_from_reply(reply):
+    """Parse an SCPI error reply into ``(code, exact_reply)``."""
+    exact = str(reply or "")
+    if not exact:
+        return (None, "")
+    head = exact.split(",", 1)[0].strip()
+    try:
+        return (int(head), exact)
+    except ValueError:
+        return (None, exact)
+
+
+def _is_error_queue_query(command):
+    """True for an explicit SYSTem:ERRor[:NEXT]? queue inspection."""
+    head = str(command or "").strip().upper().split(None, 1)[0]
+    return (head.endswith("?") and head.startswith("SYST")
+            and ":ERR" in head)
+
+
+def checked_exchange(link, command, expect_reply=True, check_error=False):
+    """Run one command and, when requested, attribute only its own error.
+
+    Additel's error query removes the oldest queued item.  Clear stale items
+    immediately before the command, capture its first error afterwards, then
+    clear any additional residue.  An explicit error-queue query is left
+    untouched so the Terminal can still inspect the queue deliberately.
+    Returns ``(reply, error_reply)``; ``error_reply`` is ``None`` when no
+    automatic queue check was requested.
+    """
+    inspect_error = bool(check_error) and not _is_error_queue_query(command)
+    if not inspect_error:
+        reply = (link.query(command) if expect_reply
+                 else (link.write(command) or ""))
+        return (reply, None)
+
+    link.write("*CLS")
+    try:
+        try:
+            reply = (link.query(command) if expect_reply
+                     else (link.write(command) or ""))
+        except TimeoutError:
+            # Invalid query headers normally have no data reply.  If the
+            # device did record an error, report that useful result instead
+            # of exposing a generic read timeout.
+            error_reply = link.query(ERROR_QUERY)
+            code, _ = error_code_from_reply(error_reply)
+            if code not in (None, 0):
+                return ("", error_reply)
+            raise
+        error_reply = link.query(ERROR_QUERY)
+        return (reply, error_reply)
+    finally:
+        try:
+            link.write("*CLS")
+        except Exception:
+            pass
+
+
 class HeatSource:
     def __init__(self, profile, logger=None):
         self.profile = dict(profile)
@@ -371,13 +429,7 @@ class HeatSource:
             reply = self.link.query(ERROR_QUERY)
         except Exception:
             return (None, "")
-        if not reply:
-            return (None, "")
-        head = reply.split(",", 1)[0].strip()
-        try:
-            return (int(head), reply)
-        except ValueError:
-            return (None, reply)
+        return error_code_from_reply(reply)
 
     def _has_error_queue(self):
         """True if the instrument reports errors for bad commands.
@@ -389,29 +441,36 @@ class HeatSource:
         """
         try:
             self.link.write("*CLS")
+            baseline, _ = self._error_code()
+            if baseline != 0:
+                return False
+            # A bad header produces an error-queue entry, not a query reply.
+            # Sending it with query() needlessly waits for a response and was
+            # the source of a stale -110 when that wait failed early.
+            self.link.write(NONSENSE_COMMAND)
+            probe, _ = self._error_code()
+            if probe in (None, 0):
+                return False
+            empty, _ = self._error_code()
+            return empty == 0
         except Exception:
             return False
-        code, _ = self._error_code()
-        if code is None:
-            return False
-        try:
-            self.link.query(NONSENSE_COMMAND)
-        except Exception:
-            return False
-        code, _ = self._error_code()
-        return code is not None and code != 0
+        finally:
+            try:
+                self.link.write("*CLS")
+            except Exception:
+                pass
 
     def _accepted(self, command, use_errors, expect_reply=True):
         """Send one candidate. Returns (accepted, reply)."""
         try:
-            if use_errors:
-                self.link.write("*CLS")
-            reply = (self.link.query(command) if expect_reply
-                     else (self.link.write(command) or ""))
+            reply, error_reply = checked_exchange(
+                self.link, command, expect_reply=expect_reply,
+                check_error=use_errors)
         except Exception:
             return (False, "")
         if use_errors:
-            code, _text = self._error_code()
+            code, _text = error_code_from_reply(error_reply)
             if code is not None:
                 return (code == 0, reply)
         # No usable error queue: a parseable reply is the only evidence.

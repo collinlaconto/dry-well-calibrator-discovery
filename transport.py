@@ -313,10 +313,15 @@ class Link:
     """Command/reply protocol on top of any transport."""
 
     def __init__(self, spec=None, terminator="\r\n", reply_timeout=1.5,
-                 logger=None):
+                 logger=None, require_reply_terminator=False,
+                 max_reply_time=None):
         self.transport = make_transport(spec) if spec else None
         self.terminator = terminator
         self.reply_timeout = reply_timeout
+        self.require_reply_terminator = bool(require_reply_terminator)
+        self.max_reply_time = float(
+            max_reply_time if max_reply_time is not None
+            else max(10.0, float(reply_timeout) * 10.0))
         self.log = logger or (lambda tag, msg: None)
 
     # -------------------------------------------------------------- session --
@@ -366,31 +371,52 @@ class Link:
         self.transport._write((cmd + self.terminator).encode("ascii",
                                                              "replace"))
         self.log("TX", cmd)
-        deadline = time.time() + self.reply_timeout
+        # ``reply_timeout`` is an inactivity timeout, not a cap on the whole
+        # response.  ADT286 scan replies grow with every selected channel and
+        # each documented timestamp; at 9600 baud a valid frame can take more
+        # than two seconds while still delivering bytes continuously.
+        started = time.monotonic()
+        idle_deadline = started + self.reply_timeout
+        overall_deadline = started + self.max_reply_time
         buf = b""
-        while time.time() < deadline:
+        terminated = False
+        while (time.monotonic() < idle_deadline
+               and time.monotonic() < overall_deadline):
             chunk = self.transport._read()
             if chunk:
                 buf += chunk
-                if buf.endswith(b"\n") or buf.endswith(b"\r"):
-                    time.sleep(0.03)
-                    extra = self.transport._read()
-                    if not extra:
-                        break
-                    buf += extra
+                idle_deadline = time.monotonic() + self.reply_timeout
+                terminated = buf.endswith(b"\n") or buf.endswith(b"\r")
+                continue
+            if terminated:
+                break
+            # Real serial/TCP reads already wait briefly.  This tiny pause
+            # prevents a custom non-blocking transport from busy-spinning.
+            time.sleep(0.005)
+        if self.require_reply_terminator and not terminated:
+            self.log("RX", "<incomplete reply>")
+            raise TimeoutError(
+                f"Incomplete reply to {cmd!r}: the instrument stopped "
+                "before the response terminator.")
         text = buf.decode("ascii", "replace")
         lines = [ln.strip() for ln in re.split(r"[\r\n]+", text) if ln.strip()]
         if lines and lines[0].strip().upper() == cmd.strip().upper():
             lines = lines[1:]                    # strip echo
-        reply = lines[0] if lines else ""
+        # Preserve every non-echo response line.  In particular, do not drop
+        # an ADT286 scan body if firmware frames its documented timestamp as a
+        # separate line.
+        reply = "\n".join(lines)
         self.log("RX", reply or "<no reply>")
         return reply
 
 
-def make_link(target, terminator="\r\n", reply_timeout=1.5, logger=None):
+def make_link(target, terminator="\r\n", reply_timeout=1.5, logger=None,
+              require_reply_terminator=False, max_reply_time=None):
     """A Link bound to a connection target, whatever the transport."""
     return Link(target, terminator=terminator, reply_timeout=reply_timeout,
-                logger=logger)
+                logger=logger,
+                require_reply_terminator=require_reply_terminator,
+                max_reply_time=max_reply_time)
 
 
 # Backwards-compatible alias: earlier code called this SerialLink.

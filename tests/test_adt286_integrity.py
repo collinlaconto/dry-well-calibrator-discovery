@@ -72,6 +72,66 @@ class ParseScanDataTests(unittest.TestCase):
         self.assertEqual(parsed["raw_temperature"], temperature)
         self.assertEqual(parsed["raw_electrical"], electrical)
 
+    def test_multiline_frame_timestamp_preserves_adjacent_first_channel(self):
+        stamp = "2026:08:05 17:04:03 123"
+        payload = (
+            stamp + "\r\n\"" + scan_group("REF", "20.125") + ";"
+            + scan_group("DUT", "20.250") + ";\""
+        )
+
+        parsed = parse_scan_data(payload)
+
+        self.assertEqual(set(parsed), {"REF", "DUT"})
+        self.assertEqual(parsed["REF"]["raw_temperature"], "20.125")
+        self.assertEqual(parsed["DUT"]["raw_temperature"], "20.250")
+        self.assertEqual(parsed["REF"]["device_timestamp"], stamp)
+        self.assertEqual(parsed["DUT"]["device_timestamp"], stamp)
+
+    def test_timestamp_touching_last_value_does_not_discard_device_token(self):
+        stamp = "2026:08:05 17:04:03 123"
+
+        parsed = parse_scan_data(
+            scan_group("REF", "20.125000000000000001") + stamp
+        )["REF"]
+
+        self.assertEqual(parsed["raw_temperature"],
+                         "20.125000000000000001")
+        self.assertEqual(parsed["device_timestamp"], stamp)
+
+    def test_ordered_frame_timestamps_are_mapped_without_host_substitution(self):
+        first = "2026:08:05 17:04:03 123"
+        second = "2026:08:05 17:04:03 456"
+        payload = (
+            first + ";" + second + ";\""
+            + scan_group("REF", "20.1") + ";"
+            + scan_group("DUT", "20.2") + ";\""
+        )
+
+        parsed = parse_scan_data(payload)
+
+        self.assertEqual(parsed["REF"]["device_timestamp"], first)
+        self.assertEqual(parsed["DUT"]["device_timestamp"], second)
+
+    def test_large_timestamped_frame_preserves_every_exact_device_value(self):
+        stamp = "2026:08:05 17:04:03 123"
+        expected = {
+            f"CH1-{index:02d}": f"{20 + index / 100:.18f}"
+            for index in range(1, 43)
+        }
+        payload = (
+            stamp + "\r\n\""
+            + ";".join(scan_group(channel, value)
+                       for channel, value in expected.items())
+            + ";\""
+        )
+
+        parsed = parse_scan_data(payload)
+
+        self.assertEqual(set(parsed), set(expected))
+        for channel, exact_value in expected.items():
+            self.assertEqual(parsed[channel]["raw_temperature"], exact_value)
+            self.assertEqual(parsed[channel]["device_timestamp"], stamp)
+
 
 class ReadingAndScanTests(unittest.TestCase):
     def test_reading_is_immutable(self):
@@ -143,6 +203,26 @@ class ReadingAndScanTests(unittest.TestCase):
         self.assertIsNone(frame["DUT"])
         self.assertIsNone(adt.latest("REF"))
         self.assertIsNone(adt.latest("DUT"))
+
+    def test_partial_frames_activate_recovery_instead_of_disabling_freshness(self):
+        link = RepeatingLink(
+            scan_group("REF", "20.0") + ",2026:08:05 17:04:03 123"
+        )
+        adt = Adt286()
+        adt.link = link
+        adt._subs = {"run": ["REF", "DUT"]}
+        adt.recover_after = 2
+        adt.recover_min_gap = 0.0
+
+        with patch("calsuite.adt286.time.time", side_effect=[10.0, 20.0]):
+            adt._last_poll_started = -1e9
+            self.assertEqual(adt.poll_once(), 0)
+            adt._last_poll_started = -1e9
+            self.assertEqual(adt.poll_once(), 0)
+
+        self.assertEqual(adt.recoveries, 1)
+        self.assertIsNone(adt.freshness_supported)
+        self.assertIn("missing DUT", adt.last_error)
 
 
 if __name__ == "__main__":

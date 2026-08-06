@@ -18,7 +18,7 @@ from .adt286 import Adt286
 from .engine import (ChannelRegistry, RunEngine, default_profile,
                      tolerance_at, validate_profile, STATE_RUNNING)
 from .formats import KNOWN_MODELS, profile_for_model
-from .heatsource import HeatSource
+from .heatsource import HeatSource, checked_exchange
 from .transport import (CANDIDATE_TCP_PORTS, DEFAULT_TCP_PORT,
                         SERIAL_OK, SERIAL_ERROR,
                         available_ports, describe_target, find_tcp_port,
@@ -1510,12 +1510,11 @@ class SuiteApp(tk.Tk):
             try:
                 with lock:
                     self._term_log("TX", f"{name}  <-  {cmd}")
-                    reply = (link.query(cmd) if is_query
-                             else (link.write(cmd) or ""))
+                    reply, err = checked_exchange(
+                        link, cmd, expect_reply=is_query, check_error=check)
                     self._term_log("RX", reply if reply
                                    else "(no reply)")
-                    if check and not cmd.upper().startswith("SYST"):
-                        err = link.query("SYSTem:ERRor?")
+                    if err is not None:
                         if not err:
                             self._term_log("WARN",
                                            "SYSTem:ERRor? gave nothing - this "
