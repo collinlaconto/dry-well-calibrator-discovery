@@ -25,7 +25,7 @@ from .transport import (CANDIDATE_TCP_PORTS, DEFAULT_TCP_PORT,
                         normalize_target, target_is_set)
 
 APP_TITLE = "Calibration Automation Suite"
-APP_BUILD = "2026.08.06.3"
+APP_BUILD = "2026.08.06.4"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Profile libraries live beside run_calibration_suite.py. That is HERE's
 # parent when the modules are in a calsuite/ folder, and HERE itself when
@@ -364,6 +364,10 @@ class SuiteApp(tk.Tk):
         self.log_queue = queue.Queue()
         self._run_seq = 0
         self.history_cycles = {}
+        self._ui_scan_frame = None
+        self._reference_progress = {}
+        self._last_refresh_error = ""
+        self._rack_layout = None
 
         self._build_ui()
         self._log(
@@ -428,27 +432,35 @@ class SuiteApp(tk.Tk):
 
     def _drain(self):
         try:
-            while True:
-                tag, message = self.log_queue.get_nowait()
+            for _ in range(100):
+                try:
+                    tag, message = self.log_queue.get_nowait()
+                except queue.Empty:
+                    break
                 stamp = datetime.now().strftime("%H:%M:%S")
                 for widget in (self.log_main,):
                     widget.configure(state="normal")
                     widget.insert("end", f"{stamp} [{tag}] {message}\n", tag)
                     widget.see("end")
                     widget.configure(state="disabled")
-        except queue.Empty:
-            pass
-        try:
-            while True:
-                self._handle_event(self.events.get_nowait())
-        except queue.Empty:
-            pass
-        self._refresh_run_table()
-        self._refresh_live_panel()
-        try:
+            for _ in range(100):
+                try:
+                    event = self.events.get_nowait()
+                except queue.Empty:
+                    break
+                self._handle_event(event)
+
+            # All run cards, the focused monitor and the detail table use one
+            # immutable copy of the latest shared device frame for this paint.
+            # This avoids one run advancing between separate widget reads.
+            self._ui_scan_frame = self._capture_ui_scan()
+            self._refresh_run_table()
+            self._refresh_live_panel()
             health = self.adt.health
             colour = ("#b00020" if "no data" in health
-                      else "#9a6700" if "recovered" in health else "#444")
+                      else "#9a6700" if any(
+                          word in health for word in ("recovered", "waiting"))
+                      else "#444")
             self.lbl_scan.configure(text=f"286 scan: {health}",
                                     foreground=colour)
             active = sum(1 for engine in self.engines.values()
@@ -456,9 +468,15 @@ class SuiteApp(tk.Tk):
             self.nb.set_status(
                 "DATA POLICY\nDevice readings retained unadjusted\n\n"
                 f"ADT286\n{health}\n\nRUNS\n{active} active")
-        except Exception:
-            pass
-        self.after(300, self._drain)
+            self._last_refresh_error = ""
+        except Exception as exc:
+            message = f"Runs display refresh failed: {exc}"
+            if message != self._last_refresh_error:
+                self._last_refresh_error = message
+                self.log_queue.put(("FAIL", message))
+        finally:
+            self._ui_scan_frame = None
+            self.after(300, self._drain)
 
     def _handle_event(self, ev):
         kind = ev.get("kind")
@@ -468,6 +486,16 @@ class SuiteApp(tk.Tk):
         elif kind == "state":
             self._log("INFO", f"[{name}] run {ev.get('state')}")
             self._refresh_results_choices()
+            if ev.get("state") != "running":
+                self._reference_progress.pop(ev.get("run_id"), None)
+        elif kind == "phase":
+            if ev.get("phase") != "waiting for stability":
+                self._reference_progress.pop(ev.get("run_id"), None)
+        elif kind == "reference":
+            self._reference_progress[ev.get("run_id")] = {
+                "elapsed": ev.get("elapsed"),
+                "span": ev.get("span"),
+            }
         elif kind == "result":
             r = ev.get("result")
             if r is not None:
@@ -761,9 +789,33 @@ class SuiteApp(tk.Tk):
     # --- tab 3 -------------------------------------------------------------
     def _build_runs_tab(self):
         t = ttk.Frame(self.nb)
+        # The outer tab owns a scrolling canvas; ``page`` contains the run
+        # controls and naturally-sized cards.
+        self.runs_canvas = tk.Canvas(
+            t, background=theme.SHELL, highlightthickness=0, borderwidth=0)
+        run_scroll = ttk.Scrollbar(
+            t, orient="vertical", command=self.runs_canvas.yview)
+        self.runs_canvas.configure(yscrollcommand=run_scroll.set)
+        run_scroll.pack(side="right", fill="y")
+        self.runs_canvas.pack(side="left", fill="both", expand=True)
+        page = ttk.Frame(self.runs_canvas)
+        self.runs_page = page
+        page_window = self.runs_canvas.create_window(
+            (0, 0), window=page, anchor="nw")
+        page.bind(
+            "<Configure>",
+            lambda _event: self.runs_canvas.configure(
+                scrollregion=self.runs_canvas.bbox("all")))
+        self.runs_canvas.bind(
+            "<Configure>",
+            lambda event: self.runs_canvas.itemconfigure(
+                page_window, width=event.width))
+        self.bind_all("<MouseWheel>", self._scroll_runs_wheel, add="+")
+        self.bind_all("<Button-4>", self._scroll_runs_wheel, add="+")
+        self.bind_all("<Button-5>", self._scroll_runs_wheel, add="+")
         self.nb.add(t, text=" 3 · Runs ")
 
-        head = ttk.Frame(t)
+        head = ttk.Frame(page)
         head.pack(fill="x", padx=18, pady=(18, 10))
         titles = ttk.Frame(head)
         titles.pack(side="left")
@@ -774,7 +826,7 @@ class SuiteApp(tk.Tk):
         self.lbl_scan = ttk.Label(head, text="", style="Dim.TLabel")
         self.lbl_scan.pack(side="right", pady=(6, 0))
 
-        bar = ttk.Frame(t)
+        bar = ttk.Frame(page)
         bar.pack(fill="x", padx=18, pady=(0, 12))
         self.var_run_choice = tk.StringVar()
         self.cbo_run_choice = ttk.Combobox(bar, textvariable=self.var_run_choice,
@@ -788,23 +840,23 @@ class SuiteApp(tk.Tk):
                    command=self._stop_all).pack(side="right")
 
         # the run you are watching, at a size readable across the bench
-        self.monitor = theme.MonitorCard(t)
+        self.monitor = theme.MonitorCard(page)
         self.monitor.pack(fill="x", padx=18, pady=(0, 12))
         self.history = {}          # run_id -> deque of (t, reference)
         self._monitor_channels = None
 
         # every other run, one compact strip each
-        self.rack = ttk.Frame(t)
+        self.rack = ttk.Frame(page)
         self.rack.pack(fill="x", padx=18)
         self.strips = {}
         self.selected_run = None
         self.lbl_empty = ttk.Label(
-            t, style="Dim.TLabel",
+            page, style="Dim.TLabel",
             text="No calibrations running. Choose a profile above and start "
                  "one — you can run several at once, one per heat source.")
         self.lbl_empty.pack(anchor="w", padx=18, pady=8)
 
-        live = ttk.Frame(t)
+        live = ttk.Frame(page)
         live.pack(fill="both", expand=True, padx=18, pady=(14, 8))
         lh = ttk.Frame(live)
         lh.pack(fill="x")
@@ -822,7 +874,7 @@ class SuiteApp(tk.Tk):
             self.tbl_live.column(c, width=w, anchor="w")
         self.tbl_live.pack(fill="both", expand=True, pady=(6, 0))
 
-        ttk.Label(t, style="Dim.TLabel", wraplength=940, justify="left",
+        ttk.Label(page, style="Dim.TLabel", wraplength=940, justify="left",
                   text=("All runs share the one 286: their channels are "
                         "scanned together and the readings fanned out, so a "
                         "channel belongs to one run while it is active.")
@@ -830,9 +882,27 @@ class SuiteApp(tk.Tk):
 
     def _select_run(self, run_id):
         self.selected_run = run_id
-        for rid, strip in self.strips.items():
-            strip.set_selected(rid == run_id)
+        self._layout_run_strips()
         self._refresh_live_panel()
+        self.after_idle(lambda: self.runs_canvas.yview_moveto(0.0))
+
+    def _scroll_runs_wheel(self, event):
+        """Scroll only when the wheel event came from inside the Runs page."""
+        widget = getattr(event, "widget", None)
+        while widget is not None:
+            if widget in (self.runs_page, self.runs_canvas):
+                number = getattr(event, "num", None)
+                if number in (4, 5):
+                    steps = -1 if number == 4 else 1
+                else:
+                    delta = getattr(event, "delta", 0)
+                    if not delta:
+                        return None
+                    steps = -1 if delta > 0 else 1
+                self.runs_canvas.yview_scroll(steps, "units")
+                return "break"
+            widget = getattr(widget, "master", None)
+        return None
 
     # --- tab 4 -------------------------------------------------------------
     def _build_results_tab(self):
@@ -2131,10 +2201,15 @@ class SuiteApp(tk.Tk):
         self._refresh_results_choices()
 
     def _selected_run_id(self):
-        if self.selected_run in self.engines:
-            return self.selected_run
         active = [rid for rid, e in self.engines.items() if e.is_active]
-        return active[0] if len(active) == 1 else None
+        if self.selected_run in self.engines:
+            selected = self.engines[self.selected_run]
+            if selected.is_active or not active:
+                return self.selected_run
+        if active:
+            self.selected_run = active[0]
+            return self.selected_run
+        return self.selected_run if self.selected_run in self.engines else None
 
     def _stop_selected(self):
         run_id = self._selected_run_id()
@@ -2171,13 +2246,22 @@ class SuiteApp(tk.Tk):
         channels = ([engine.profile.get("reference_channel", "")] +
                     list(engine.profile.get("dut_channels", [])))
         if engine.is_active:
-            reference = self.adt.latest(channels[0]) if channels[0] else None
+            if not channels[0]:
+                return {}, None, None
+            shared = getattr(self, "_ui_scan_frame", None)
+            try:
+                frame = (self.adt.snapshot(channels) if shared is None else
+                         {channel: shared.get(channel) for channel in channels})
+            except Exception:
+                return {}, None, None
+            reference = frame.get(channels[0])
             if reference is None:
                 return {}, None, None
-            frame = self.adt.snapshot(channels, cycle=reference.cycle)
             values = {channel: reading.temperature
                       for channel, reading in frame.items()
-                      if reading is not None and reading.temperature is not None}
+                      if (reading is not None and
+                          reading.cycle == reference.cycle and
+                          reading.temperature is not None)}
             return values, reference.timestamp, reference.cycle
         if engine.results and engine.results[-1].samples:
             sample = engine.results[-1].samples[-1]
@@ -2185,6 +2269,23 @@ class SuiteApp(tk.Tk):
             values.update(dict(sample.get("duts", {})))
             return values, sample.get("t"), sample.get("cycle")
         return {}, None, None
+
+    def _capture_ui_scan(self):
+        """Copy the shared ADT cache once without performing device I/O."""
+        channels = []
+        for engine in self.engines.values():
+            if not engine.is_active:
+                continue
+            for channel in ([engine.profile.get("reference_channel", "")] +
+                            list(engine.profile.get("dut_channels", []))):
+                if channel and channel not in channels:
+                    channels.append(channel)
+        if not channels:
+            return {}
+        try:
+            return self.adt.snapshot(channels)
+        except Exception:
+            return {}
 
     def _refresh_live_panel(self):
         """Reference and DUT readings for the selected (or only) run."""
@@ -2204,6 +2305,10 @@ class SuiteApp(tk.Tk):
         ref_ch = engine.profile.get("reference_channel", "")
         values, acquired, _cycle = self._display_frame(engine)
         ref_value = values.get(ref_ch)
+        expected_channels = [ref_ch] + list(
+            engine.profile.get("dut_channels", []))
+        missing_channels = [channel for channel in expected_channels
+                            if values.get(channel) is None]
         ref_age = (None if acquired is None else
                    max(0.0, time.time() - acquired))
         rows = [(ref_ch, "reference probe", ref_value, None, ref_age)]
@@ -2224,7 +2329,12 @@ class SuiteApp(tk.Tk):
                         "" if error is None else f"{error:+.3f} {unit}",
                         "—" if age is None else f"{age:.0f} s ago"))
         name = engine.profile.get("name", "")
-        if stale and engine.is_active:
+        if engine.is_active and missing_channels:
+            self.lbl_live_note.configure(
+                text=f"{name}: waiting for one complete device frame for this "
+                     "run; missing " + ", ".join(missing_channels)
+                     + ". No value is being substituted.")
+        elif stale and engine.is_active:
             self.lbl_live_note.configure(
                 text=f"{name}: readings are going stale — the 286's scan may "
                      "have been interrupted. It is being re-established "
@@ -2249,7 +2359,6 @@ class SuiteApp(tk.Tk):
             if strip is None:
                 strip = theme.RunStrip(self.rack, on_select=self._select_run,
                                        run_id=run_id)
-                strip.pack(fill="x", pady=(0, 10))
                 strip.set_channels(eng.profile.get("dut_channels", []),
                                    self._tolerance_for(eng))
                 self.strips[run_id] = strip
@@ -2295,6 +2404,8 @@ class SuiteApp(tk.Tk):
             if run_id not in self.engines:
                 self.strips.pop(run_id).destroy()
 
+        self._layout_run_strips()
+
         self._refresh_monitor()
 
         active = sum(1 for e in self.engines.values() if e.is_active)
@@ -2306,6 +2417,24 @@ class SuiteApp(tk.Tk):
             self.lbl_empty.pack_forget()
         else:
             self.lbl_empty.pack(anchor="w", padx=18, pady=8)
+
+    def _layout_run_strips(self):
+        """Show compact cards for every run except the focused one."""
+        selected = self._selected_run_id()
+        order = tuple(run_id for run_id in self.engines
+                      if run_id in self.strips)
+        signature = (selected, order)
+        if signature == self.__dict__.get("_rack_layout"):
+            return
+        self._rack_layout = signature
+        for strip in self.strips.values():
+            strip.set_selected(False)
+            if strip.winfo_manager():
+                strip.pack_forget()
+        for run_id in order:
+            if run_id != selected:
+                strip = self.strips[run_id]
+                strip.pack(fill="x", pady=(0, 10))
 
     def _refresh_monitor(self):
         """The focused run, shown large with its stabilisation curve."""
@@ -2380,13 +2509,17 @@ class SuiteApp(tk.Tk):
         """The pass/fail tolerance at the point being measured."""
         return tolerance_at(engine.profile, max(engine.current_index, 0))
 
-    @staticmethod
-    def _flat_text(engine):
+    def _flat_text(self, engine):
         if not engine.is_active:
             return "—"
         if engine.phase == "sampling":
             return "stable"
         window = engine.profile.get("stability_window")
+        progress = self._reference_progress.get(engine.run_id, {})
+        elapsed = progress.get("elapsed")
+        if window and isinstance(elapsed, (int, float)):
+            elapsed = min(max(elapsed, 0.0), window)
+            return f"{elapsed:.0f} of {window:g} s"
         return f"0 of {window:g} s" if window else "—"
 
     # -------------------------------------------------------------- results --

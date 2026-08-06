@@ -438,6 +438,12 @@ poll serves everyone. That is why channels are locked to a run while it is
 active, why starting or finishing a run briefly reconfigures the scan, and why
 the live readings on the Runs tab cost nothing extra.
 
+The serial query and the live-reading cache are isolated from one another, so
+a slow multi-channel reply cannot freeze the Runs page. Each run receives only
+a complete same-cycle frame for its own reference and DUT channels; a missing
+or stale channel in a different run cannot blank valid device data for this
+one.
+
 The software never changes the 286's channel setup or its units. Those are
 global, so altering them mid-flight would corrupt another run's data — set
 sensor types on the instrument beforehand. Channels are shown with their

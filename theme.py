@@ -250,8 +250,12 @@ class Panel(tk.Frame):
         inset = max(pad, radius)
         self.inner = tk.Frame(self, background=background, bd=0,
                               highlightthickness=0)
-        self.inner.place(x=inset, y=inset, relwidth=1, relheight=1,
-                         width=-2 * inset, height=-2 * inset)
+        # ``place`` does not contribute to a parent's requested size.  These
+        # cards contain live labels and variable DUT rows, so a placed inner
+        # frame let MonitorCard/RunStrip collapse to a one-pixel-high shell.
+        # Packing the content gives the outer card its natural, visible height;
+        # the canvas remains placed behind it as the rounded background.
+        self.inner.pack(fill="both", expand=True, padx=inset, pady=inset)
         self._shape = None
         self.bind("<Configure>", self._redraw)
 
@@ -797,12 +801,13 @@ class RunStrip(Panel):
         # left: which calibration, on what
         left = tk.Frame(self.inner, background=PANEL, width=228)
         left.pack(side="left", fill="y", padx=(6, 12), pady=6)
-        left.pack_propagate(False)
         self.name = tk.Label(left, text="", background=PANEL, foreground=INK,
-                             anchor="w", font=FONTS.get("ui_bold", ("", 10, "bold")))
+                             anchor="w", justify="left", wraplength=210,
+                             font=FONTS.get("ui_bold", ("", 10, "bold")))
         self.name.pack(fill="x")
         self.source = tk.Label(left, text="", background=PANEL, foreground=DIM,
-                               anchor="w", font=FONTS.get("small", ("", 9)))
+                               anchor="w", justify="left", wraplength=210,
+                               font=FONTS.get("small", ("", 9)))
         self.source.pack(fill="x")
         self.phase = tk.Label(left, text="", background=PANEL, foreground=AMBER,
                               anchor="w", font=FONTS.get("label", ("", 8)))
@@ -814,7 +819,6 @@ class RunStrip(Panel):
         # right: deviation from the reference
         right = tk.Frame(self.inner, background=PANEL, width=272)
         right.pack(side="right", fill="y", padx=(12, 6), pady=6)
-        right.pack_propagate(False)
         head = tk.Frame(right, background=PANEL)
         head.pack(fill="x")
         tk.Label(head, text="DEVIATION", background=PANEL, foreground=DIM,
@@ -836,7 +840,7 @@ class RunStrip(Panel):
         row.pack(fill="x")
         self.ref = self._cell(row, "Reference", FONTS.get("readout", ("", 20)))
         self.setp = self._cell(row, "Set point", FONTS.get("readout_sm", ("", 12)))
-        self.flat = self._cell(row, "Flat for", FONTS.get("readout_sm", ("", 12)))
+        self.flat = self._cell(row, "Observed", FONTS.get("readout_sm", ("", 12)))
         self.track = tk.Canvas(mid, height=6, background=PANEL,
                                highlightthickness=0)
         self.track.pack(fill="x", pady=(11, 0))
@@ -849,6 +853,7 @@ class RunStrip(Panel):
         for w in (self, self.inner, left, mid, right, self.name, self.source,
                   self.phase, self.steps):
             w.bind("<Button-1>", self._clicked)
+        self._bind_selection_tree()
 
     def _cell(self, parent, label, valuefont):
         box = tk.Frame(parent, background=PANEL)
@@ -864,6 +869,14 @@ class RunStrip(Panel):
     def _clicked(self, _event=None):
         if self.on_select:
             self.on_select(self.run_id)
+
+    def _bind_selection_tree(self):
+        """Make every visible part of the compact card select its run."""
+        pending = [self]
+        while pending:
+            widget = pending.pop()
+            widget.bind("<Button-1>", self._clicked)
+            pending.extend(widget.winfo_children())
 
     def set_selected(self, on):
         self.selected = on
@@ -913,6 +926,7 @@ class RunStrip(Panel):
                                  tolerance=tolerance)
             band.pack(side="left", fill="x", expand=True, padx=(6, 6))
             self.bands[channel] = (band, value)
+        self._bind_selection_tree()
 
     def update_channel(self, channel, error, tolerance=None):
         entry = self.bands.get(channel)

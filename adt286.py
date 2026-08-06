@@ -47,7 +47,7 @@ CHANNEL_TYPES = {
 }
 
 SCAN_RATES = ("100", "1000", "4000")
-DRIVER_REVISION = "ADT286-2026.08.06.3-hyphen-timestamp"
+DRIVER_REVISION = "ADT286-2026.08.06.4-multirun-cache"
 DEVICE_TIME_RE = re.compile(
     r"(?:\d{4}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2})"
     r"\s+\d{2}:\d{2}:\d{2}(?:[ .:]\d{1,9})?")
@@ -245,13 +245,21 @@ class Adt286:
     def __init__(self, logger=None):
         self.log = logger or (lambda tag, msg: None)
         self.link = None
-        self.lock = threading.RLock()          # guards the serial link
+        self.lock = threading.RLock()          # guards blocking serial I/O
+        # Cached device readings must remain available while a serial query is
+        # in flight.  In particular, the Tk refresh thread must never wait for
+        # SCAN:DATA:Last? (which may take up to the transport timeout).  Keep
+        # short-lived subscription/cache state behind a separate lock and
+        # always acquire ``lock`` before ``_state_lock`` when both are needed.
+        self._state_lock = threading.RLock()
         self.idn = ""
         self.unit = ""
         self.channels = []                     # discovered channel names
         self.channel_info = {}                 # name -> config dict
         self.scan_rate = "1000"
         self._subs = {}                        # owner -> [channels]
+        self._group_failures = {}              # owner -> consecutive bad frames
+        self._scan_channels = ()               # configured union on the device
         self._readings = {}                    # channel -> Reading
         self._cycle = 0
         self._poll_stop = threading.Event()
@@ -331,12 +339,14 @@ class Adt286:
                     pass
             if self.link is not None:
                 self.link.close()
-        with self.lock:
-            self._subs.clear()
-            self._readings.clear()
             self._last_device_times.clear()
             self.freshness_supported = None
             self._traced_scan_signatures.clear()
+        with self._state_lock:
+            self._subs.clear()
+            self._group_failures.clear()
+            self._readings.clear()
+        self._scan_channels = ()
         self.log("INFO", "ADT286 disconnected.")
 
     # ----------------------------------------------------------- channels --
@@ -376,20 +386,26 @@ class Adt286:
     def subscribe(self, owner, channels):
         """Add an owner's channels to the shared scan."""
         with self.lock:
-            self._subs[owner] = list(channels)
+            with self._state_lock:
+                self._subs[owner] = list(channels)
+                self._group_failures[owner] = 0
             try:
                 self._restart_scan(strict=True)
             except Exception:
-                self._subs.pop(owner, None)
+                with self._state_lock:
+                    self._subs.pop(owner, None)
+                    self._group_failures.pop(owner, None)
                 raise
 
     def unsubscribe(self, owner):
         with self.lock:
-            self._subs.pop(owner, None)
+            with self._state_lock:
+                self._subs.pop(owner, None)
+                self._group_failures.pop(owner, None)
             self._restart_scan()
 
     def subscribed_channels(self):
-        with self.lock:
+        with self._state_lock:
             seen = []
             for chans in self._subs.values():
                 for c in chans:
@@ -420,6 +436,9 @@ class Adt286:
         if not chans:
             try:
                 self.link.write("SCAN:STOP")
+                self._scan_channels = ()
+                with self._state_lock:
+                    self._group_failures.clear()
                 self.log("INFO", "No subscribers left; scanning stopped.")
                 return True
             except Exception as e:
@@ -430,11 +449,19 @@ class Adt286:
         cmd = f'SCAN:MULT:STARt {self.scan_rate},"{",".join(chans)}"'
         try:
             self.link.write(cmd)
-            # Anything cached predates this scan configuration.  Clearing it
-            # prevents the UI or a newly-started run from presenting it as a
-            # reading from the reconfigured scan.
-            for channel in chans:
-                self._readings.pop(channel, None)
+            # Retain complete frames for channels that remain subscribed. They
+            # are immutable device data with their original cycle and age, and
+            # engines already require a newer cycle before using them. Clear
+            # only channels newly introduced to this scan configuration so a
+            # second run cannot blank the first run's live display.
+            newly_added = set(chans).difference(self._scan_channels)
+            with self._state_lock:
+                for channel in newly_added:
+                    self._readings.pop(channel, None)
+                self._group_failures = {
+                    owner: 0 for owner in self._subs
+                }
+            self._scan_channels = tuple(chans)
             self._last_poll_started = 0.0
             self._bad_polls = 0
             self.log("INFO", f"Scanning {len(chans)} channel(s): "
@@ -462,11 +489,41 @@ class Adt286:
         if t and t.is_alive():
             t.join(timeout=3.0)
 
-    def _note_bad_poll(self, reason):
+    def _note_bad_poll(self, reason, recover_after=None):
         """Count a poll that produced nothing usable; recover if persistent."""
         self._bad_polls += 1
-        if self._bad_polls < self.recover_after:
+        threshold = (self.recover_after if recover_after is None
+                     else max(self.recover_after, int(recover_after)))
+        if self._bad_polls < threshold:
             return False
+        return self._recover_scan(reason)
+
+    def _group_recover_after(self, channels, union_channels=None):
+        """Grace for one run, based on the physical scan's entire union."""
+        try:
+            interval = max(float(self.poll_interval),
+                           self.minimum_poll_interval, 0.1)
+        except (TypeError, ValueError):
+            interval = max(self.minimum_poll_interval, 0.1)
+        union = tuple(union_channels or self._scan_channels or channels)
+        # The 286 can acquire channels successively. Allow one configured scan
+        # period per union channel plus one polling interval, but recover before
+        # the engine's third consecutive 15-second acquisition timeout.
+        # Leave one full poll interval after recovery for the first new query
+        # to finish before the engine's third 15-second timeout.
+        recovery_deadline = max(
+            self.recover_after * interval,
+            40.0 - interval,
+        )
+        grace_seconds = min(
+            len(union) * self.scan_period + interval,
+            recovery_deadline,
+        )
+        return max(self.recover_after,
+                   int(math.ceil(grace_seconds / interval)))
+
+    def _recover_scan(self, reason):
+        """Re-establish the configured union without discarding cached data."""
         now = time.time()
         if now - self._last_recovery < self.recover_min_gap:
             return False
@@ -493,10 +550,14 @@ class Adt286:
 
     def poll_once(self):
         """One scan read. Returns the number of channels updated."""
-        requested = self.subscribed_channels()
-        if self.link is None or not self.link.is_open or not requested:
-            return 0
         with self.lock:
+            # Capture the channel union only after taking the I/O lock.  A
+            # subscribe/unsubscribe operation reconfigures the device under
+            # this same lock, so the response is always checked against the
+            # scan configuration that actually produced it.
+            requested = self.subscribed_channels()
+            if self.link is None or not self.link.is_open or not requested:
+                return 0
             # Request Additel's optional device timestamp and avoid querying
             # faster than the configured scan period.  Firmware that supplies
             # timestamps gets physical-scan de-duplication.  Firmware that
@@ -543,101 +604,172 @@ class Adt286:
             if not data:
                 self._note_bad_poll("no readings came back")
                 return 0
+            # Validate atomically per subscriber, not across unrelated runs.
+            # A run may only receive a frame when its own reference and every
+            # DUT are present and usable.  A bad channel in another run must
+            # not blank or stall this run's wholly device-sourced frame.
+            with self._state_lock:
+                group_entries = []
+                for owner, subscribed in self._subs.items():
+                    group = tuple(dict.fromkeys(
+                        channel for channel in subscribed if channel))
+                    if group:
+                        group_entries.append((owner, group))
+
+            valid_entries = []
+            invalid_entries = []
+            for owner, group in group_entries:
+                if all(channel in data and
+                       data[channel]["temperature"] is not None
+                       for channel in group):
+                    valid_entries.append((owner, group))
+                else:
+                    invalid_entries.append((owner, group))
+
+            valid_groups = [group for _owner, group in valid_entries]
+            invalid_groups = [group for _owner, group in invalid_entries]
+
+            valid_channels = list(dict.fromkeys(
+                channel for group in valid_groups for channel in group))
+            invalid_only_channels = set(
+                channel for group in invalid_groups for channel in group
+            ).difference(valid_channels)
+            if invalid_only_channels:
+                with self._state_lock:
+                    for channel in invalid_only_channels:
+                        self._readings.pop(channel, None)
+
             missing_channels = [c for c in requested if c not in data]
-            if missing_channels:
-                for channel in requested:
-                    self._readings.pop(channel, None)
-                self.last_error = (
-                    "ADT286 returned an incomplete scan frame; missing "
-                    + ", ".join(missing_channels))
-                self._note_bad_poll(
-                    "an incomplete response omitted "
-                    + ", ".join(missing_channels))
-                return 0
-            missing_device_times = [
-                c for c in requested
-                if not data[c].get("device_timestamp")]
             unusable = [c for c in requested
                         if c not in data or data[c]["temperature"] is None]
-            if unusable:
-                # A calibration frame is atomic: never publish the valid
-                # subset when any requested channel is unusable.  Otherwise a
-                # reference-only consumer could count an old/partial physical
-                # scan while the DUT evidence for that cycle is absent.
-                self._note_bad_poll(
-                    f"{len(unusable)} subscribed channel(s) missing or invalid "
-                    "in the scan")
-                for channel in requested:
-                    self._readings.pop(channel, None)
+            if not valid_groups:
+                detail = ("missing " + ", ".join(missing_channels)
+                          if missing_channels else
+                          f"{len(unusable)} channel(s) were invalid")
+                self.last_error = "ADT286 returned no complete run frame; " + detail
+                self._note_bad_poll(detail)
                 return 0
+
+            missing_device_times = [
+                channel for channel in valid_channels
+                if not data[channel].get("device_timestamp")]
+            if missing_device_times:
+                if self.freshness_supported is not False:
+                    self.log(
+                        "WARN", "This ADT286 firmware omitted the optional "
+                        "device timestamp from SCAN:DATA:Last? 1. Complete "
+                        "device readings will be recorded; device-time fields "
+                        "remain blank and host receipt time is kept separately."
+                    )
+                self.freshness_supported = False
             else:
-                # Only a complete, usable frame may change timestamp mode or
-                # freshness history.  A rejected frame must never erase the
-                # evidence needed to identify an old timestamped frame later.
-                if missing_device_times:
-                    for channel in requested:
-                        self._last_device_times.pop(channel, None)
-                    if self.freshness_supported is not False:
-                        self.log(
-                            "WARN", "This ADT286 firmware omitted the optional "
-                            "device timestamp from SCAN:DATA:Last? 1. Complete "
-                            "device readings will be recorded; device-time "
-                            "fields remain blank and host receipt time is kept "
-                            "separately."
-                        )
-                    self.freshness_supported = False
+                if self.freshness_supported is False:
+                    self.log(
+                        "INFO", "ADT286 device timestamps are available again; "
+                        "physical-scan de-duplication resumed.")
+                self.freshness_supported = True
+
+            fresh_entries = []
+            repeated_times = []
+            for owner, group in valid_entries:
+                group_times = [data[channel].get("device_timestamp")
+                               for channel in group]
+                if all(group_times):
+                    repeated = [
+                        channel for channel in group
+                        if self._last_device_times.get(channel) ==
+                        data[channel].get("device_timestamp")]
+                    if repeated:
+                        repeated_times.extend(repeated)
+                        continue
                 else:
-                    if self.freshness_supported is False:
-                        self.log(
-                            "INFO", "ADT286 device timestamps are available "
-                            "again; physical-scan de-duplication resumed.")
-                    self.freshness_supported = True
-                    repeated_times = [
-                        c for c in requested
-                        if self._last_device_times.get(c) ==
-                        data[c].get("device_timestamp")]
-                    if repeated_times:
-                        self._note_bad_poll(
-                            "the device acquisition timestamp did not advance "
-                            "for " + ", ".join(repeated_times))
-                        return 0
-                self._bad_polls = 0
+                    # Timestamp support is optional.  Clear only this run's
+                    # history; never substitute host time as device time.
+                    for channel in group:
+                        self._last_device_times.pop(channel, None)
+                fresh_entries.append((owner, group))
+
+            fresh_owners = {owner for owner, _group in fresh_entries}
+            with self._state_lock:
+                for owner, _group in group_entries:
+                    if owner in fresh_owners:
+                        self._group_failures[owner] = 0
+                    else:
+                        self._group_failures[owner] = (
+                            self._group_failures.get(owner, 0) + 1)
+                failure_counts = dict(self._group_failures)
+
+            recovery_entries = [
+                (owner, group) for owner, group in group_entries
+                if failure_counts.get(owner, 0) >=
+                self._group_recover_after(group, requested)
+            ]
+
+            fresh_channels = list(dict.fromkeys(
+                channel for _owner, group in fresh_entries for channel in group))
+            if not fresh_channels:
+                # A multi-channel scan may update its channels successively.
+                # Allow at least one poll per subscribed channel before the
+                # watchdog restarts it, or a larger two-run scan can be reset
+                # forever just before its complete frame becomes fresh.
+                self._note_bad_poll(
+                    "the device acquisition timestamp did not advance for "
+                    + ", ".join(dict.fromkeys(repeated_times)),
+                    recover_after=min(
+                        self._group_recover_after(group, requested)
+                        for _owner, group in group_entries))
+                return 0
+
+            self._bad_polls = 0
+            if invalid_groups:
+                self.last_error = (
+                    "ADT286 omitted or invalidated "
+                    + ", ".join(sorted(invalid_only_channels))
+                    + "; other complete run frame(s) remain live")
+            else:
                 self.last_error = ""
-            self._cycle += 1
+
             now = time.time()
             acquired = time.monotonic()
-            for name in requested:
-                vals = data.get(name)
-                if vals is None:
-                    self._readings.pop(name, None)
-                    continue
-                self._readings[name] = Reading(
-                    channel=name,
-                    temperature=vals["temperature"],
-                    unit=vals["unit"],
-                    electrical=vals["electrical"],
-                    electrical_unit=vals["electrical_unit"],
-                    cycle=self._cycle,
-                    timestamp=now,
-                    monotonic=acquired,
-                    device_timestamp=vals["device_timestamp"],
-                    raw_temperature=vals["raw_temperature"],
-                    raw_electrical=vals["raw_electrical"],
-                )
-            if self.freshness_supported:
-                self._last_device_times.update(
-                    {name: data[name]["device_timestamp"]
-                     for name in requested})
-            reported_units = {data[c]["unit"] for c in requested
-                              if c in data and data[c]["temperature"] is not None
-                              and data[c]["unit"]}
+            # Publish all complete run frames from this response atomically.
+            # Other run groups retain their preceding complete cycle until
+            # their own full set of device timestamps advances.
+            with self._state_lock:
+                self._cycle += 1
+                cycle = self._cycle
+                for name in fresh_channels:
+                    vals = data[name]
+                    self._readings[name] = Reading(
+                        channel=name,
+                        temperature=vals["temperature"],
+                        unit=vals["unit"],
+                        electrical=vals["electrical"],
+                        electrical_unit=vals["electrical_unit"],
+                        cycle=cycle,
+                        timestamp=now,
+                        monotonic=acquired,
+                        device_timestamp=vals["device_timestamp"],
+                        raw_temperature=vals["raw_temperature"],
+                        raw_electrical=vals["raw_electrical"],
+                    )
+            self._last_device_times.update({
+                name: data[name]["device_timestamp"]
+                for name in fresh_channels
+                if data[name].get("device_timestamp")
+            })
+            reported_units = {data[c]["unit"] for c in fresh_channels
+                              if data[c]["unit"]}
             if len(reported_units) == 1:
                 reported = next(iter(reported_units))
                 if reported != self.unit:
                     self.log("WARN", f"ADT286 scan unit changed from "
                                      f"{self.unit or '(unknown)'} to {reported}.")
                     self.unit = reported
-            return len(requested) - len(unusable)
+            if recovery_entries:
+                owners = ", ".join(owner for owner, _group in recovery_entries)
+                self._recover_scan(
+                    "complete device frames stayed unavailable for " + owners)
+            return len(fresh_channels)
 
     def _poll_loop(self):
         while not self._poll_stop.is_set():
@@ -650,7 +782,7 @@ class Adt286:
 
     # ---------------------------------------------------------- readings ---
     def latest(self, channel):
-        with self.lock:
+        with self._state_lock:
             return self._readings.get(channel)
 
     def snapshot(self, channels, cycle=None):
@@ -659,7 +791,7 @@ class Adt286:
         A channel that is absent or belongs to a different cycle maps to
         ``None``.  Callers never receive a mixed-cycle sample by accident.
         """
-        with self.lock:
+        with self._state_lock:
             out = {}
             for channel in channels:
                 reading = self._readings.get(channel)
@@ -670,7 +802,7 @@ class Adt286:
 
     @property
     def cycle(self):
-        with self.lock:
+        with self._state_lock:
             return self._cycle
 
     @property
@@ -682,7 +814,11 @@ class Adt286:
             return "idle (no run subscribed)"
         if self._bad_polls:
             return f"no data for {self._bad_polls} poll(s) - recovering"
+        with self._state_lock:
+            waiting = sum(count > 0 for count in self._group_failures.values())
         base = "scanning"
+        if waiting:
+            base += f" ({waiting} run frame(s) waiting)"
         if self.freshness_supported is False:
             base += " (device time unavailable; host receipt time retained)"
         if self.recoveries:
