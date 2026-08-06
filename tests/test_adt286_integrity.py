@@ -9,6 +9,13 @@ bootstrap_calsuite()
 from calsuite.adt286 import Adt286, Reading, parse_scan_data
 
 
+FAULT_LOG_2_PAYLOAD = (
+    '"REF1,1281,1,2026-08-06 16:58:23 861,109.592810,109.592810,'
+    '1001,1,24.175371;CH1-01A,1243,1,2026-08-06 16:25:32 000,'
+    '0.027320,0.027320,1001,1,24.00675,32767,0,1001,1,23.33;"'
+)
+
+
 def scan_group(channel, temperature, electrical="1.0000000000000001", unit_id=1001):
     return (
         f"{channel},1281,1,{electrical},{electrical},"
@@ -49,6 +56,29 @@ def timestamped_payload(stamp, ref="20.0", dut="20.1"):
 
 
 class ParseScanDataTests(unittest.TestCase):
+    def test_exact_fault_log_2_hyphen_timestamps_preserve_device_values(self):
+        parsed = parse_scan_data(FAULT_LOG_2_PAYLOAD)
+
+        self.assertEqual(set(parsed), {"REF1", "CH1-01A"})
+        reference = parsed["REF1"]
+        dut = parsed["CH1-01A"]
+        self.assertEqual(reference["raw_temperature"], "24.175371")
+        self.assertEqual(reference["raw_electrical"], "109.592810")
+        self.assertEqual(reference["temperature"], 24.175371)
+        self.assertEqual(reference["electrical"], 109.592810)
+        self.assertEqual(reference["unit"], "°C")
+        self.assertEqual(reference["electrical_unit"], "Ω")
+        self.assertEqual(reference["device_timestamp"],
+                         "2026-08-06 16:58:23 861")
+        self.assertEqual(dut["raw_temperature"], "24.00675")
+        self.assertEqual(dut["raw_electrical"], "0.027320")
+        self.assertEqual(dut["temperature"], 24.00675)
+        self.assertEqual(dut["electrical"], 0.027320)
+        self.assertEqual(dut["unit"], "°C")
+        self.assertEqual(dut["electrical_unit"], "mV")
+        self.assertEqual(dut["device_timestamp"],
+                         "2026-08-06 16:25:32 000")
+
     def test_nonfinite_temperature_is_rejected_but_raw_token_is_retained(self):
         for token in ("nan", "inf", "-inf"):
             with self.subTest(token=token):
@@ -134,6 +164,28 @@ class ParseScanDataTests(unittest.TestCase):
 
 
 class ReadingAndScanTests(unittest.TestCase):
+    def test_exact_fault_log_2_frame_publishes_both_subscribed_channels(self):
+        adt = Adt286()
+        adt.link = RepeatingLink(FAULT_LOG_2_PAYLOAD)
+        adt._subs = {"run": ["REF1", "CH1-01A"]}
+        adt._last_poll_started = -1e9
+
+        with patch("calsuite.adt286.time.monotonic",
+                   side_effect=[10.0, 10.01]), \
+             patch("calsuite.adt286.time.time",
+                   return_value=1_700_000_000.0):
+            self.assertEqual(adt.poll_once(), 2)
+
+        frame = adt.snapshot(["REF1", "CH1-01A"], cycle=1)
+        self.assertEqual(frame["REF1"].raw_temperature, "24.175371")
+        self.assertEqual(frame["CH1-01A"].raw_temperature, "24.00675")
+        self.assertEqual(frame["REF1"].device_timestamp,
+                         "2026-08-06 16:58:23 861")
+        self.assertEqual(frame["CH1-01A"].device_timestamp,
+                         "2026-08-06 16:25:32 000")
+        self.assertEqual(adt.freshness_supported, True)
+        self.assertEqual(adt.recoveries, 0)
+
     def test_reading_is_immutable(self):
         reading = Reading(
             "REF", 20.0, "°C", cycle=4, timestamp=100.5,

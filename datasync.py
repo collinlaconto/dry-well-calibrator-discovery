@@ -1019,6 +1019,12 @@ _DEVICE_TIMESTAMP_FORMATS = (
     "%Y:%m:%d %H:%M:%S %f",
     "%Y:%m:%d %H:%M:%S.%f",
     "%Y:%m:%d %H:%M:%S:%f",
+    # TAU-HOST 1.0.0.90 has been observed returning the same documented
+    # device timestamp with a hyphenated date.  Preserve and parse that exact
+    # device token; never substitute host receipt time.
+    "%Y-%m-%d %H:%M:%S %f",
+    "%Y-%m-%d %H:%M:%S.%f",
+    "%Y-%m-%d %H:%M:%S:%f",
 )
 
 

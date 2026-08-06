@@ -101,6 +101,29 @@ class DeviceTimestampSeriesTests(unittest.TestCase):
             ],
         )
 
+    def test_observed_hyphenated_device_times_control_alignment(self):
+        later = sample(
+            {"REF": "2026-08-06 16:58:23 861",
+             "DUT": "2026-08-06 16:25:32 000"},
+            ref=24.175371, dut=24.00675, host_time=1.0,
+        )
+        earlier = sample(
+            {"REF": "2026-08-06 16:58:22 861",
+             "DUT": "2026-08-06 16:25:31 000"},
+            ref=24.075371, dut=23.90675, host_time=9_999_999_999.0,
+        )
+
+        reference = datasync.series_from_run(
+            run_engine((later, earlier)), "REF")
+        dut = datasync.series_from_run(run_engine((later, earlier)), "DUT")
+
+        self.assertEqual(reference["_value"].tolist(), [24.075371, 24.175371])
+        self.assertEqual(dut["_value"].tolist(), [23.90675, 24.00675])
+        self.assertEqual(
+            dut.loc[0, "_abs_time"].to_pydatetime(),
+            datetime(2026, 8, 6, 16, 25, 31),
+        )
+
     def test_device_time_controls_sort_order_not_host_receipt_time(self):
         later_device_time = sample(
             {"REF": "2026:08:05 12:00:02 000", "DUT": "2026:08:05 12:00:02 000"},

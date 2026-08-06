@@ -315,6 +315,28 @@ def _positive(value):
     return number is not None and number > 0
 
 
+def result_evidence_counts(results):
+    """Return (sample-complete, incomplete) counts without changing evidence."""
+    complete = incomplete = 0
+    for result in results:
+        expected = getattr(result, "expected_samples", None)
+        reference = getattr(result, "reference", {}) or {}
+        duts = getattr(result, "duts", {}) or {}
+        expected_duts = getattr(result, "expected_dut_channels", ()) or ()
+        sample_counts_complete = (
+            expected is None or (
+                reference.get("n", 0) == expected and
+                all(duts.get(channel, {}).get("n", 0) == expected
+                    for channel in expected_duts)
+            )
+        )
+        if not sample_counts_complete:
+            incomplete += 1
+        else:
+            complete += 1
+    return complete, incomplete
+
+
 class SetPointResult:
     """Everything measured at one set point."""
 
@@ -1057,5 +1079,10 @@ class RunEngine:
             object.__setattr__(self, "_sealed_run", True)
             self._set_phase(PHASE_FINISHED)
             self._emit("state", state=self.state)
-            self._log("INFO", f"Run {self.state}. "
-                              f"{len(self.results)} set point(s) recorded.")
+            complete, incomplete = result_evidence_counts(self.results)
+            summary = (f"Run {self.state}. {complete} sample-complete set "
+                       "point(s) recorded.")
+            if incomplete:
+                summary += (f" {incomplete} incomplete evidence record(s) "
+                            "preserved but not recorded as calibration points.")
+            self._log("INFO", summary)

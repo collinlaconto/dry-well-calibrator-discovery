@@ -1,11 +1,12 @@
 import time
 import unittest
+from unittest.mock import patch
 
 from tests.bootstrap import bootstrap_calsuite
 
 bootstrap_calsuite()
 
-from calsuite.formats import ERROR_QUERY, NONSENSE_COMMAND
+from calsuite.formats import ERROR_QUERY, NONSENSE_COMMAND, profile_for_model
 from calsuite.heatsource import HeatSource, checked_exchange
 from calsuite.transport import Link
 from calsuite.ui import is_query_command
@@ -117,6 +118,42 @@ class QueueLink:
         return "20.0000,1001"
 
 
+class ReadOnlyDiscoveryLink:
+    """A simulated 878 that fails immediately if discovery writes anything."""
+
+    is_open = True
+
+    def __init__(self):
+        self.events = []
+        self.setpoint = 100.0
+        self.error_queue = []
+
+    def open(self, _target=None):
+        return None
+
+    def close(self):
+        return None
+
+    def write(self, command):
+        self.events.append(("write", command))
+        raise AssertionError(f"read-only discovery attempted write {command!r}")
+
+    def query(self, command):
+        self.events.append(("query", command))
+        replies = {
+            "*IDN?": "Additel,ADT878-160,TEST,1.0",
+            "TEMPerature:TARGet?": "100.000,1001",
+            "MEASure:TEMPerature?": "23.500,23.500,NaN,NaN",
+            "UNIT:TEMPerature?": "C,1001",
+            "TEMPerature:STATus?": "0",
+            "TEMP:STAB?": "0.05,1001",
+        }
+        if command in replies:
+            return replies[command]
+        self.error_queue.append(f'-110,"Unsupported query {command}"')
+        return ""
+
+
 class ErrorQueueTests(unittest.TestCase):
     def test_error_queue_probe_is_nonblocking_and_leaves_no_minus_110(self):
         source = HeatSource({})
@@ -155,6 +192,171 @@ class ErrorQueueTests(unittest.TestCase):
         self.assertEqual(reply, stale)
         self.assertIsNone(automatic_error)
         self.assertEqual(link.events, [("query", ERROR_QUERY)])
+
+
+class ReadOnlyDiscoveryTests(unittest.TestCase):
+    def source(self, profile=None):
+        source = HeatSource(profile or profile_for_model("878-160"))
+        source.link = ReadOnlyDiscoveryLink()
+        return source
+
+    def assert_only_queries(self, source):
+        self.assertTrue(source.link.events)
+        self.assertTrue(all(kind == "query"
+                            for kind, _command in source.link.events))
+        commands = [command for _kind, command in source.link.events]
+        self.assertNotIn("*CLS", commands)
+        self.assertNotIn(ERROR_QUERY, commands)
+        self.assertNotIn(NONSENSE_COMMAND, commands)
+
+    def test_verify_commands_is_strictly_read_only_and_infers_additel_write(self):
+        source = self.source()
+        before = source.link.setpoint
+
+        report = source.verify_commands(test_delta=50, restore=False)
+
+        self.assert_only_queries(source)
+        self.assertEqual(source.link.setpoint, before)
+        self.assertTrue(report["read_only"])
+        self.assertTrue(report["write_inferred"])
+        self.assertFalse(report["verified"])
+        self.assertEqual(report["write_command"],
+                         "TEMPerature:TARGet {value},{unit}")
+        self.assertEqual(source.profile["sp_write"],
+                         "TEMPerature:TARGet {value},{unit}")
+        self.assertFalse(source.profile["verified"])
+        self.assertEqual(source.profile["enable"], "")
+        self.assertEqual(source.profile["disable"], "")
+        self.assertNotIn("enable", report["adopted"])
+        self.assertNotIn("disable", report["adopted"])
+        self.assertEqual(report["control_status_query"],
+                         "TEMPerature:STATus?")
+        self.assertEqual(report["control_status_reply"], "0")
+        self.assertEqual(source.link.error_queue, [])
+        self.assertEqual(
+            [command for _kind, command in source.link.events],
+            ["*IDN?", "TEMPerature:TARGet?", "MEASure:TEMPerature?",
+             "UNIT:TEMPerature?", "TEMPerature:STATus?"],
+        )
+
+    def test_malicious_stored_read_command_is_refused_without_transmission(self):
+        unsafe_commands = (
+            "TEMPerature:TARGet 150",
+            "TEMPerature:TARGet?;TEMPerature:TARGet 150",
+            ERROR_QUERY,
+        )
+        for unsafe in unsafe_commands:
+            with self.subTest(command=unsafe):
+                source = self.source()
+                source.profile["sp_read"] = unsafe
+
+                report = source.verify_commands()
+
+                transmitted = [command for _kind, command
+                               in source.link.events]
+                self.assertNotIn(unsafe, transmitted)
+                self.assertEqual(source.link.setpoint, 100.0)
+                self.assertEqual(report["adopted"]["sp_read"],
+                                 "TEMPerature:TARGet?")
+                self.assert_only_queries(source)
+                self.assertEqual(source.link.error_queue, [])
+
+    def test_known_family_ignores_safe_looking_non_authoritative_override(self):
+        source = self.source()
+        source.profile["sp_read"] = "BOGUS?"
+
+        report = source.verify_commands()
+
+        commands = [command for _kind, command in source.link.events]
+        self.assertNotIn("BOGUS?", commands)
+        self.assertEqual(report["adopted"]["sp_read"],
+                         "TEMPerature:TARGet?")
+        self.assertEqual(source.link.error_queue, [])
+
+    def test_runtime_read_paths_reject_stored_writes_before_transmission(self):
+        cases = (
+            ("sp_read", "read_setpoint"),
+            ("unit", "read_unit"),
+            ("value", "read_temperature"),
+        )
+        unsafe = "TEMPerature:TARGet 150"
+        for key, method_name in cases:
+            with self.subTest(key=key):
+                profile = profile_for_model("878-160")
+                source = self.source(profile)
+                source.profile[key] = unsafe
+
+                with self.assertRaisesRegex(RuntimeError, "safe read query"):
+                    getattr(source, method_name)()
+
+                self.assertNotIn(unsafe, [
+                    command for _kind, command in source.link.events
+                ])
+                self.assertEqual(source.link.setpoint, 100.0)
+                self.assertEqual(source.link.error_queue, [])
+
+    def test_connect_refuses_unsafe_stored_reads_without_sending_them(self):
+        profile = profile_for_model("878-160")
+        unsafe_sp = "TEMPerature:TARGet 150"
+        unsafe_unit = "UNIT:TEMPerature?;TEMPerature:TARGet 150"
+        link = ReadOnlyDiscoveryLink()
+        source = HeatSource(profile)
+        source.profile["sp_read"] = unsafe_sp
+        source.profile["unit"] = unsafe_unit
+
+        with patch("calsuite.heatsource.make_link", return_value=link):
+            source.connect({"kind": "tcp", "host": "192.0.2.1",
+                            "tcp_port": 8000})
+
+        commands = [command for _kind, command in link.events]
+        self.assertEqual(commands, ["*IDN?"])
+        self.assertNotIn(unsafe_sp, commands)
+        self.assertNotIn(unsafe_unit, commands)
+        self.assertEqual(link.setpoint, 100.0)
+        self.assertEqual(link.error_queue, [])
+
+    def test_legacy_additel_outp_defaults_are_removed_on_load(self):
+        profile = profile_for_model("878-160")
+        profile["enable"] = " OUTP:STAT   1 "
+        profile["disable"] = "outp:stat 0"
+
+        source = HeatSource(profile)
+
+        self.assertEqual(source.profile["enable"], "")
+        self.assertEqual(source.profile["disable"], "")
+        self.assertFalse(source.profile["verified"])
+
+    def test_known_family_read_overrides_are_migrated_to_authoritative_forms(self):
+        profile = profile_for_model("878-160")
+        profile["sp_read"] = "BOGUS?"
+        profile["value"] = "OTHER?"
+        profile["unit"] = "UNITS?"
+
+        source = HeatSource(profile)
+
+        self.assertEqual(source.profile["sp_read"],
+                         "TEMPerature:TARGet?")
+        self.assertEqual(source.profile["value"],
+                         "MEASure:TEMPerature?")
+        self.assertEqual(source.profile["unit"],
+                         "UNIT:TEMPerature?")
+
+    def test_setpoint_sweep_is_query_only_and_leaves_write_unverified(self):
+        source = self.source()
+        before = source.link.setpoint
+
+        result = source.sweep("sp_read")
+
+        self.assert_only_queries(source)
+        self.assertEqual(source.link.setpoint, before)
+        self.assertEqual(result["winner"], "TEMPerature:TARGet?")
+        self.assertTrue(result["read_only"])
+        self.assertTrue(result["write_inferred"])
+        self.assertFalse(result["verified"])
+        self.assertEqual(source.profile["sp_write"],
+                         "TEMPerature:TARGet {value},{unit}")
+        self.assertFalse(source.profile["verified"])
+        self.assertEqual(source.link.error_queue, [])
 
 
 if __name__ == "__main__":

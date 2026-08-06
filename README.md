@@ -156,8 +156,9 @@ obvious.
 ## Quick start
 
 1. **Instruments** — connect the ADT286, then each heat source.
-2. Select a heat source and press **Check / discover commands** (once per
-   instrument, ever).
+2. Select a heat source and press **Read-only check / discover** (once per
+   instrument, ever). This check is strictly read-only and cannot start the
+   well or move its target.
 3. **Profiles** — pick the heat source, the reference probe's channel, the DUT
    channels, and type your set points. Press **Check this profile**.
 4. **Runs** — start it. Watch live readings; start another run on another heat
@@ -197,29 +198,32 @@ already using it.
 
 ## Teaching it a heat source's commands
 
-Different manufacturers use quite different remote command sets, so rather
-than assume, the software proves them against the instrument.
+Different manufacturers use quite different remote command sets, so the
+software discovers their read commands from the instrument's own replies.
 
-Connect the heat source, select it in the table, and press **Check / discover
-commands**. It tries candidate commands for the set point, temperature, unit
-and heat/cool control, keeps whichever the instrument actually answers, and
-confirms the set-point write by changing it slightly and reading it back
-before restoring the original value. The heat/cool command is found from its
-read-only query form and is **never actuated**. Whatever it proves is saved,
-so this is a one-time step per instrument.
+Connect the heat source, select it in the table, and press **Read-only check /
+discover**. It tries candidate commands for the set point, temperature, unit
+and control status, and keeps whichever read query the instrument actually
+answers. It sends **queries only**: no set-point, control, password, `*CLS`, or
+error-queue command is sent. A matching set-point write template can be
+inferred from the successful read command, but it is not sent or marked
+verified. The first calibration run exercises that write only when it is ready
+to command the requested point, and immediately requires device readback.
+Discovered syntax is saved, so this is a one-time step per instrument.
 
 Two details it handles for you:
 
-- **Verification by error queue.** A write command returns nothing, so its
-  reply proves nothing. Where an instrument keeps an error queue, each
-  candidate is confirmed with `SYSTem:ERRor?` — `0` means accepted, `-110`
-  means the header wasn't recognised. The queue is cleared immediately before
-  each checked command, so an older error cannot be blamed on a later command.
-  Instruments without an error queue fall back to judging by replies.
+- **Read-only means non-actuating.** Known model profiles use their documented
+  read queries only. Discovery never sends a target, control, password,
+  `*CLS`, deliberate bad-header, or error-queue command. For an unknown/generic
+  profile, however, the instrument may log an unsupported query as a
+  diagnostic error; the suite leaves that queue untouched instead of clearing
+  or consuming it. Manual Terminal service commands can inspect the queue only
+  when an operator explicitly asks for that operation.
 - **Set points that need a unit.** Additel wells report the set point as value
-  *and* unit (`60.0000,1001`) and require the unit back on a write; sent
-  without it they answer `-109 Missing parameter` and nothing changes. The
-  write template carries a `{unit}` placeholder:
+  *and* unit (`60.0000,1001`) and require the unit back on a target write. The
+  query-only discovery therefore infers a template carrying a `{unit}`
+  placeholder without sending it:
 
   ```
   TEMPerature:TARGet {value},{unit}   ->   TEMPerature:TARGet 60.00,1001
@@ -412,7 +416,7 @@ nameplate, since the software refuses set points outside the range you set.
 | A console window sits behind the app | Start `Calibration Automation Suite.pyw`. If one still appears, Windows may be opening `.pyw` files with `python.exe`: right-click the file, Open with, and choose `pythonw.exe`. The `.py` launcher also hides its own console and, failing that, restarts itself windowless. Set `CALSUITE_KEEP_CONSOLE=1` to keep the console for debugging. |
 | Readings stop mid-run | The 286's display was changed, cancelling the scan. It recovers automatically within a few seconds — watch the scan health indicator. |
 | Every set point times out, but the bath looks steady | The stability window is too short for the scan rate. Use at least three read intervals, or scan faster. |
-| No set-point command recognised | Run **Check / discover commands**. If it still fails, use the Terminal's **Find set-point command**, then type candidates by hand. |
+| No set-point command recognised | Run **Read-only check / discover**. If it still fails, use the Terminal's **Find set-point command**, then type candidates by hand. |
 | `-109 Missing parameter` on a write | The instrument needs the unit with the value. Re-run discovery; it will adopt the `{unit}` form. |
 | `-110 Command header error` | Wrong command for this instrument — the dialect differs by manufacturer. |
 | Set point won't change | It may be locked on the instrument. Tick "Send password before set points", or unlock it on the panel. |
@@ -444,18 +448,21 @@ configured type so you can confirm assignments.
 - **ADT286** — from Additel's published command set (`MODule:INFormation?`,
   `MODule:CONFig?`, `SCAN:MULT:STARt`, `SCAN:DATA:Last? 1`, `SCAN:STOP`,
   `UNIT:TEMPerature?`). The scan-data parser is tested against Additel's own
-  worked example and tolerates the longer thermocouple form with cold-junction
-  fields appended.
+  worked example, the longer thermocouple form with cold-junction fields, and
+  the hyphenated `yyyy-MM-dd` acquisition timestamps returned by observed
+  TAU-HOST 1.0.0.90 firmware. Exact device timestamp and numeric tokens are
+  retained; host receipt time is never substituted for device time.
 - **Fluke 917X wells and 6109A/7109A baths** — from their manuals.
 - **Hart Scientific micro-baths** (`t`, `s=`, `u`) — from long-standing
   convention, not a manual.
-- **Additel wells** — inferred from Additel's house style in their published
-  command sets, where the root keyword is the quantity itself
-  (`TEMPerature:TARGet`, not `SOURce:SPOint`). **Not** copied from the 878
-  document.
+- **Additel 878 wells** — the official programming document defines the
+  read-only `TEMPerature:TARGet?` and `TEMPerature:STATus?` queries, the target
+  write requiring a unit ID, and separate state-changing control commands.
+  Discovery uses only the read queries and does not infer a context-free
+  output-enable command.
 
-The last two are exactly why discovery exists: run **Check / discover
-commands** and let the instrument settle it before trusting a run to it. The
+The less-certain command sets are exactly why discovery exists: run **Read-only
+check / discover** to collect read-only evidence before trusting a run. The
 authoritative lists are the "Programming Commands" PDFs on Additel's Product
 Resources page, and the manuals for Fluke gear.
 

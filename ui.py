@@ -25,7 +25,7 @@ from .transport import (CANDIDATE_TCP_PORTS, DEFAULT_TCP_PORT,
                         normalize_target, target_is_set)
 
 APP_TITLE = "Calibration Automation Suite"
-APP_BUILD = "2026.08.06.2"
+APP_BUILD = "2026.08.06.3"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Profile libraries live beside run_calibration_suite.py. That is HERE's
 # parent when the modules are in a calsuite/ folder, and HERE itself when
@@ -51,6 +51,30 @@ def is_query_command(command):
         return False
     head = exact.split(None, 1)[0]
     return head.endswith("?")
+
+
+def result_log_entry(name, result):
+    """Describe a result event without altering its retained evidence."""
+    expected = getattr(result, "expected_samples", None)
+    reference = getattr(result, "reference", {}) or {}
+    actual = reference.get("n", 0)
+    point = f"{result.setpoint:g}{result.unit}"
+    if expected is not None and actual != expected:
+        return (
+            "WARN",
+            f"[{name}] {point} incomplete evidence preserved "
+            f"({actual} of {expected} samples); calibration point not recorded.",
+        )
+    verdict = getattr(result, "verdict", "")
+    if verdict == "invalid":
+        issues = "; ".join(getattr(result, "quality_issues", ()) or ())
+        detail = f": {issues}" if issues else ""
+        return "WARN", f"[{name}] {point} recorded as INVALID{detail}"
+    if verdict == "fail":
+        return "FAIL", f"[{name}] {point} recorded — calibration result FAIL"
+    if verdict == "pass":
+        return "PASS", f"[{name}] {point} recorded — calibration result PASS"
+    return "INFO", f"[{name}] {point} recorded (no tolerance verdict)"
 
 
 
@@ -447,9 +471,8 @@ class SuiteApp(tk.Tk):
         elif kind == "result":
             r = ev.get("result")
             if r is not None:
-                flag = "" if r.stable else "  (NOT STABLE)"
-                self._log("PASS", f"[{name}] {r.setpoint:g}{r.unit} recorded"
-                                  f"{flag}")
+                tag, message = result_log_entry(name, r)
+                self._log(tag, message)
                 self._refresh_results_choices()
                 if self.var_result_run.get() in ("", name):
                     self.var_result_run.set(name)
@@ -570,7 +593,7 @@ class SuiteApp(tk.Tk):
                    command=self._connect_source).pack(side="left", padx=6)
         theme.Button(row, text="Disconnect selected",
                    command=self._disconnect_source).pack(side="left")
-        theme.Button(row, text="Check / discover commands",
+        theme.Button(row, text="Read-only check / discover",
                    command=self._verify_source).pack(side="left", padx=8)
         self.pick_source = ConnectionPicker(hs, on_log=self._instrument_log)
         self.pick_source.pack(fill="x", padx=6, pady=(0, 6))
@@ -1715,7 +1738,7 @@ class SuiteApp(tk.Tk):
             self._log("INFO", f"[{name}] check: {item}")
 
     def _verify_source(self):
-        """Prove (or discover) the selected heat source's command set."""
+        """Discover the selected heat source's commands with queries only."""
         sel = self.tbl_sources.selection()
         if not sel:
             messagebox.showinfo("Check commands",
@@ -1732,8 +1755,8 @@ class SuiteApp(tk.Tk):
                for engine in self.engines.values()):
             messagebox.showerror(
                 "Run in progress",
-                "Command discovery can move the heat source set point. Stop "
-                f"the calibration using {name} before running discovery.")
+                "Read-only discovery shares the instrument connection. Stop "
+                f"the calibration using {name} before checking commands.")
             return
 
         def work():
@@ -1744,7 +1767,7 @@ class SuiteApp(tk.Tk):
                     "Check commands", f"{source.name}: {e}"))
                 return
             self.after(0, lambda: self._verified(source, report))
-        self._log("INFO", f"[{name}] checking commands over "
+        self._log("INFO", f"[{name}] running read-only command discovery over "
                           f"{source.connection}…")
         threading.Thread(target=work, daemon=True).start()
 
@@ -1771,10 +1794,14 @@ class SuiteApp(tk.Tk):
                       "check Additel's 'Programming Commands' PDF for the "
                       "exact syntax. The Activity log shows everything that "
                       "was tried."]
+        elif report.get("read_only"):
+            lines += ["", "Read-only discovery completed. No set point, "
+                          "output-state command, or error-queue command was "
+                          "sent. The "
+                          "write candidate was not sent and will first "
+                          "be sent and confirmed after you start a run."]
         elif report.get("verified"):
-            lines += ["", "Every command was proved on the instrument, "
-                          "including the set-point write (tested with a small "
-                          "change and restored)."]
+            lines += ["", "Every command was confirmed on the instrument."]
         else:
             lines += ["", "Commands answered, but the set-point write could "
                           "not be confirmed by readback."]

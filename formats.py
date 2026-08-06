@@ -72,18 +72,28 @@ FAMILIES = {
     },
     "additel_well": {
         "label": "Additel dry well / bath (875 / 878 series)",
-        # Left empty deliberately: Additel's published 878 command list was not
-        # available to confirm, so nothing is asserted here. Use "Verify
-        # commands" and the instrument itself decides what works.
-        "commands": {},
+        # Discovery remains query-only.  The target write is inferred from the
+        # target read only after the instrument supplies a parseable reply; it
+        # is first exercised by a run, where immediate readback is mandatory.
+        "commands": {
+            # Official/bench-confirmed ADT878 read forms. Keeping these exact
+            # avoids spraying unsupported query candidates into the device's
+            # diagnostic queue during ordinary discovery.
+            "sp_read": "TEMPerature:TARGet?",
+            "value": "MEASure:TEMPerature?",
+            "unit": "UNIT:TEMPerature?",
+        },
         "value_alts": [],
-        "enable": "OUTP:STAT 1",
-        "disable": "OUTP:STAT 0",
+        # The official 878 control-state command needs a target and unit, so it
+        # cannot safely be represented by the generic no-argument output API.
+        # In particular, OUTP:STAT is not an Additel 878 command.
+        "enable": "",
+        "disable": "",
         "password": "",
         "probe": True,
         "checklist": [
-            "Run 'Verify commands' once — the syntax below is adopted from "
-            "what the instrument actually answers, not assumed",
+            "Run 'Read-only check / discover' once. Discovery sends read "
+            "queries only; it never changes the target or starts control",
             "The ADT286 also ships native Additel drivers, useful as a "
             "cross-check",
             "Authoritative syntax: 'Programming Commands for 878' at "
@@ -136,12 +146,9 @@ KNOWN_MODELS = {
 # Candidates tried by HeatSource.verify_commands.
 #
 # Two dialects live here. Fluke/Hart wells use standard SCPI SOURce naming
-# (SOUR:SPO). Additel does NOT: in their published command sets the root
-# keyword is the measured quantity, so a pressure controller uses
-# "PRESsure:TARGet <value>" and "PRESsure:MODE", with no SOURce subsystem at
-# all. The TEMPerature:* forms below are that same pattern applied to a
-# temperature source -- inferred from Additel's house style, which is exactly
-# why they are probed and confirmed rather than assumed.
+# (SOUR:SPO). Additel's official 878 command set defines the optional SOURce
+# root and TEMPerature:TARGet? query. Discovery probes only read forms; the
+# paired write is inferred but never sent by command discovery.
 SP_READ_CANDIDATES = (
     # Additel style
     "TEMPerature:TARGet?", "TEMP:TARG?",
@@ -171,16 +178,21 @@ VALUE_CANDIDATES = (
 UNIT_CANDIDATES = ("UNIT:TEMPerature?", "UNIT:TEMP?",
                    "TEMPerature:UNIT?", "u")
 
-# Read-only queries used to find the heat/cool control command. Only the
-# QUERY form is ever sent during discovery, so probing can never start the
-# instrument heating; the paired writes are inferred from whichever answers.
+# Read-only queries used to find context-free heat/cool control commands on
+# instruments whose manuals define such a pair.  Additel is deliberately not
+# represented here: its official STATus:CONTrol command requires a target and
+# unit, and must not be inferred as a no-argument enable/disable operation.
 CONTROL_PAIRS = {
-    "TEMPerature:MODE?": ("TEMPerature:MODE 1", "TEMPerature:MODE 0"),
-    "TEMP:MODE?": ("TEMP:MODE 1", "TEMP:MODE 0"),
-    "TEMPerature:CONTrol?": ("TEMPerature:CONTrol 1",
-                             "TEMPerature:CONTrol 0"),
     "OUTP:STAT?": ("OUTP:STAT 1", "OUTP:STAT 0"),
     "OUTPut:STATe?": ("OUTPut:STATe ON", "OUTPut:STATe OFF"),
+}
+
+# Official read-only state queries that may be reported during discovery but
+# never imply a context-free enable/disable command.
+CONTROL_STATUS_CANDIDATES = {
+    "additel_well": ("TEMPerature:STATus?",),
+    "fluke_scpi": ("OUTP:STAT?",),
+    "fluke_bath": ("OUTP:STAT?",),
 }
 
 # Optional extras worth knowing about if the instrument offers them.

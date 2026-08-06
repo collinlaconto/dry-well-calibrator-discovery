@@ -14,11 +14,12 @@ from calsuite.adt286 import Reading
 from calsuite.engine import (
     RunEngine,
     SetPointResult,
+    result_evidence_counts,
     STATE_DONE,
     STATE_ERROR,
     STATE_RUNNING,
 )
-from calsuite.ui import SuiteApp
+from calsuite.ui import SuiteApp, result_log_entry
 
 
 DEG_C = "\N{DEGREE SIGN}C"
@@ -80,6 +81,36 @@ class CompletedRunStateTests(unittest.TestCase):
 
 
 class DerivedResultIntegrityTests(unittest.TestCase):
+    def test_zero_sample_preserved_evidence_is_never_logged_as_pass(self):
+        result = SetPointResult(
+            -40.0, DEG_C, tolerance=0.05, expected_samples=10,
+            expected_dut_channels=("DUT",),
+        )
+        result.setpoint_command = "TEMPerature:TARGet -40,1001"
+        result.summarise(["DUT"])
+
+        tag, message = result_log_entry("Calibration 1", result)
+
+        self.assertEqual(tag, "WARN")
+        self.assertIn("0 of 10 samples", message)
+        self.assertIn("calibration point not recorded", message)
+        self.assertNotIn("PASS", message)
+
+    def test_incomplete_evidence_is_excluded_from_completed_point_count(self):
+        incomplete = SetPointResult(
+            -40.0, DEG_C, expected_samples=3,
+            expected_dut_channels=("DUT",),
+        ).summarise(["DUT"])
+        complete = valid_result((19.99, 20.01))
+        missing_dut = valid_result(
+            (19.99, 20.01), expected_duts=("DUT1", "DUT2"),
+            summarised_duts=("DUT1",),
+        )
+
+        counts = result_evidence_counts((incomplete, complete, missing_dut))
+
+        self.assertEqual(counts, (1, 2))
+
     def test_missing_expected_dut_is_invalid_and_all_stats_are_immutable(self):
         result = valid_result(
             (19.99, 20.01),

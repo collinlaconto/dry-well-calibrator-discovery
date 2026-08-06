@@ -8,11 +8,12 @@ profile's range raises rather than being clamped.
 import threading
 import time
 
-from .formats import (CONTROL_PAIRS, ERROR_QUERY, FAMILIES,
-                      NONSENSE_COMMAND, SP_READ_CANDIDATES, STABLE_CANDIDATES,
-                      TERMINATORS, UNIT_CANDIDATES, VALUE_CANDIDATES,
-                      WRITE_PAIRS, describe_unit_token, first_float,
-                      plausible_unit_token, second_field, unit_token_for)
+from .formats import (CONTROL_PAIRS, CONTROL_STATUS_CANDIDATES, ERROR_QUERY,
+                      FAMILIES, NONSENSE_COMMAND, SP_READ_CANDIDATES,
+                      STABLE_CANDIDATES, TERMINATORS, UNIT_CANDIDATES,
+                      VALUE_CANDIDATES, WRITE_PAIRS, describe_unit_token,
+                      first_float, plausible_unit_token, second_field,
+                      unit_token_for)
 from .formats import (unit_name_for_token, unit_name_from_reply,
                       unit_token_from_reply)
 from .transport import (describe_target, make_link, normalize_target,
@@ -40,6 +41,19 @@ def _is_error_queue_query(command):
     head = str(command or "").strip().upper().split(None, 1)[0]
     return (head.endswith("?") and head.startswith("SYST")
             and ":ERR" in head)
+
+
+def is_safe_read_command(command):
+    """Whether a configured read is non-chained and cannot be a SCPI write."""
+    exact = str(command or "").strip()
+    if not exact or any(separator in exact for separator in (";", "\r", "\n")):
+        return False
+    # Hart classic predates SCPI's question-mark convention.
+    if exact.lower() in ("s", "t", "u"):
+        return True
+    head = exact.split(None, 1)[0]
+    # Error queries consume diagnostic state even though they contain '?'.
+    return head.endswith("?") and not _is_error_queue_query(exact)
 
 
 def checked_exchange(link, command, expect_reply=True, check_error=False):
@@ -84,6 +98,27 @@ def checked_exchange(link, command, expect_reply=True, check_error=False):
 class HeatSource:
     def __init__(self, profile, logger=None):
         self.profile = dict(profile)
+        family_name = self.profile.get("family") or "unknown"
+        family = FAMILIES.get(family_name, {})
+        # Known instrument families use their authoritative read forms. A
+        # legacy/manual override such as BOGUS? may look like a query but can
+        # still add -110 to the device queue before discovery repairs it.
+        if family_name not in ("generic_scpi", "unknown"):
+            for key in ("sp_read", "value", "unit"):
+                command = (family.get("commands") or {}).get(key)
+                if command:
+                    self.profile[key] = command
+        # Migrate the unsafe Additel defaults written by older suite builds.
+        # The ADT878 does not implement OUTP:STAT, and its documented control
+        # transition requires a target and unit rather than a context-free
+        # enable/disable pair.
+        if self.profile.get("family") == "additel_well":
+            enable = " ".join(str(self.profile.get("enable") or "").split())
+            disable = " ".join(str(self.profile.get("disable") or "").split())
+            if enable.upper() == "OUTP:STAT 1":
+                self.profile["enable"] = ""
+            if disable.upper() == "OUTP:STAT 0":
+                self.profile["disable"] = ""
         self.log = logger or (lambda tag, msg: None)
         self.lock = threading.RLock()
         self.terminator = TERMINATORS.get(
@@ -121,6 +156,15 @@ class HeatSource:
 
     def _cmd(self, key):
         return (self.profile.get(key) or "").strip()
+
+    def _read_cmd(self, key):
+        """Return a validated stored read command, or fail before transmission."""
+        command = self._cmd(key)
+        if command and not is_safe_read_command(command):
+            raise RuntimeError(
+                f"{self.name}: configured {key!r} command {command!r} is not "
+                "a safe read query. Nothing was sent.")
+        return command
 
     # -------------------------------------------------------- connection ---
     @property
@@ -165,16 +209,19 @@ class HeatSource:
         # live unit again.
         self.reported_unit = ""
         self.last_unit_reply = ""
-        if self._cmd("sp_read"):
-            try:
-                self._capture_unit(self.link.query(self._cmd("sp_read")))
-            except Exception:
-                pass
-        if self._cmd("unit"):
-            try:
+        try:
+            sp_read = self._read_cmd("sp_read")
+            if sp_read:
+                self._capture_unit(self.link.query(sp_read))
+        except Exception as exc:
+            self.log("WARN", f"{self.name}: stored set-point read was not "
+                             f"used during connection: {exc}")
+        try:
+            if self._read_cmd("unit"):
                 self.read_unit()
-            except Exception:
-                pass
+        except Exception as exc:
+            self.log("WARN", f"{self.name}: stored unit read was not used "
+                             f"during connection: {exc}")
         self.profile["target"] = t
         if t["kind"] in ("serial", "bluetooth"):
             self.profile["port"] = t.get("port", "")
@@ -218,7 +265,7 @@ class HeatSource:
 
     def read_unit(self):
         """Read and retain the heat source's current device-reported unit."""
-        cmd = self._cmd("unit")
+        cmd = self._read_cmd("unit")
         if not cmd:
             return ""
         # A failed query must not leave a previous reply looking current.
@@ -241,7 +288,8 @@ class HeatSource:
 
     def refresh_reported_unit(self):
         """Obtain current unit evidence without trusting profile metadata."""
-        if self._cmd("unit"):
+        unit_cmd = self._read_cmd("unit")
+        if unit_cmd:
             # The activity log showed one empty network reply immediately
             # after output-enable, followed by normal replies on retry.  Make
             # one fresh read-only retry for an empty/failed exchange.  Never
@@ -260,11 +308,12 @@ class HeatSource:
                 if not attempt:
                     time.sleep(0.1)
             return ""
-        if self._cmd("sp_read"):
+        sp_read = self._read_cmd("sp_read")
+        if sp_read:
             self.last_unit_reply = ""
             self.reported_unit = ""
             with self.lock:
-                reply = self.link.query(self._cmd("sp_read"))
+                reply = self.link.query(sp_read)
             self.last_setpoint_readback_raw = str(reply or "")
             self._capture_unit(reply)
         return self.reported_unit
@@ -287,13 +336,13 @@ class HeatSource:
                 raise RuntimeError(
                     f"{self.name}: this set-point command needs a unit, but "
                     "none is known yet. Read the set point once (or run "
-                    "Check / discover commands) so the instrument can report "
+                    "Read-only check / discover) so the instrument can report "
                     "it.")
             out = out.replace("{unit}", token)
         return out
 
     def read_setpoint(self):
-        cmd = self._cmd("sp_read")
+        cmd = self._read_cmd("sp_read")
         if not cmd:
             return None
         with self.lock:
@@ -316,7 +365,7 @@ class HeatSource:
 
     def read_temperature(self):
         """The heat source's own block/control sensor (not the reference)."""
-        cmd = self._cmd("value")
+        cmd = self._read_cmd("value")
         if not cmd:
             return None
         with self.lock:
@@ -340,8 +389,10 @@ class HeatSource:
         with self.lock:
             if "{unit}" in tmpl and not self.effective_unit_token:
                 # Ask the instrument what unit it wants before writing.
+                sp_read = self._read_cmd("sp_read")
                 try:
-                    self._capture_unit(self.link.query(self._cmd("sp_read")))
+                    if sp_read:
+                        self._capture_unit(self.link.query(sp_read))
                 except Exception:
                     pass
             command = self.format_setpoint_command(tmpl, value)
@@ -356,7 +407,7 @@ class HeatSource:
 
     def confirm_setpoint(self, value, tolerance=0.05, settle=0.4):
         """Read the set point back. Returns (ok, readback)."""
-        if not self._cmd("sp_read"):
+        if not self._read_cmd("sp_read"):
             return (None, None)
         time.sleep(settle)
         rb = self.read_setpoint()
@@ -390,11 +441,32 @@ class HeatSource:
             return []
         return [sp for sp in setpoints if not (lo <= sp <= hi)]
 
+    def _query_candidate(self, command):
+        """Try one discovery query without writing or inspecting error state."""
+        exact = str(command or "").strip()
+        if not is_safe_read_command(exact):
+            return (False, "")
+        try:
+            reply = self.link.query(exact)
+        except Exception:
+            return (False, "")
+        return (bool(reply), reply)
+
+    def _paired_setpoint_write(self, read_command):
+        """Infer, but never send, the write paired with a proven read query."""
+        write = WRITE_PAIRS.get(read_command)
+        if (write and self.profile.get("family") == "additel_well"
+                and self.unit_token and "{unit}" not in write
+                and "TARG" in write.upper()):
+            write += ",{unit}"
+        return write
+
     def sweep(self, kind, log=None):
         """Try every candidate for one field and adopt the first that works.
 
         Used from the Terminal when a command could not be found
-        automatically. Read-only: only queries are sent.
+        automatically. Strictly read-only: only queries are sent; discovery
+        does not clear or consume the device's error queue.
         """
         say = log or (lambda tag, msg: self.log(tag, msg))
         lists = {"value": VALUE_CANDIDATES, "sp_read": SP_READ_CANDIDATES,
@@ -406,12 +478,24 @@ class HeatSource:
             raise ValueError(f"Nothing to sweep for {kind!r}.")
         if not self.is_open:
             raise RuntimeError(f"{self.name} is not connected.")
+        family_name = self.profile.get("family") or "unknown"
+        if family_name not in ("generic_scpi", "unknown"):
+            family = FAMILIES.get(family_name, {})
+            family_command = (family.get("commands") or {}).get(kind)
+            candidates = (family_command,) if family_command else ()
+        else:
+            say("WARN", "This unknown/generic search may cause the instrument "
+                        "to record rejected queries as diagnostic errors. No "
+                        "error-queue command will be sent, and the queue will "
+                        "not be cleared or consumed.")
         parser = (lambda r: (r or "").strip()) if kind == "unit" else first_float
         results, winner = [], None
+        write_inferred = False
+        say("INFO", "Read-only check / discover: no set point, control, "
+                    "password, *CLS, or error-queue command will be sent.")
         with self.lock:
-            use_errors = self._has_error_queue()
             for cmd in candidates:
-                accepted, reply = self._accepted(cmd, use_errors)
+                accepted, reply = self._query_candidate(cmd)
                 good = accepted and parser(reply) not in (None, "")
                 results.append((cmd, reply, good))
                 say("PASS" if good else "INFO",
@@ -423,16 +507,24 @@ class HeatSource:
         if winner:
             self.profile[kind] = winner
             if kind == "sp_read":
-                paired = WRITE_PAIRS.get(winner)
+                paired = self._paired_setpoint_write(winner)
                 if paired and not self._cmd("sp_write"):
                     self.profile["sp_write"] = paired
+                    write_inferred = True
+                    say("INFO", f"Inferred set-point write {paired!r} from "
+                                f"the read query. It was not sent; the "
+                                "device set point is unchanged.")
             say("PASS", f"Adopted {winner!r} as the "
                         f"{labels[kind]} command.")
         else:
             say("FAIL", f"No candidate worked for the {labels[kind]}. "
                         "Check Additel's programming-commands PDF and type "
                         "the command here to test it.")
-        return {"winner": winner, "results": results}
+        # A read-only sweep can discover syntax, but cannot verify a write,
+        # including when none of the read candidates answers.
+        self.profile["verified"] = False
+        return {"winner": winner, "results": results, "read_only": True,
+                "write_inferred": write_inferred, "verified": False}
 
     def family_checklist(self):
         fam = FAMILIES.get(self.profile.get("family") or "unknown")
@@ -494,46 +586,48 @@ class HeatSource:
         return (bool(reply), reply)
 
     def verify_commands(self, test_delta=0.5, restore=True, log=None):
-        """Probe candidate commands live and adopt whatever the instrument
-        actually answers to.
+        """Discover command syntax using device queries and nothing else.
 
-        Two dialects are tried: standard SCPI SOURce naming (Fluke wells) and
-        Additel's own style, where the root keyword is the quantity itself
-        (TEMPerature:TARGet rather than SOURce:SPOint). Where the instrument
-        keeps an error queue, each candidate is confirmed with SYSTem:ERRor?
-        -- which is the only reliable way to test a command that returns
-        nothing.
-
-        Only the set-point write changes anything, by a small delta that is
-        then restored. The heat/cool control command is discovered from its
-        read-only query form and never actuated.
+        ``test_delta`` and ``restore`` remain for API compatibility but cannot
+        enable a write.  Set-point write syntax may be inferred from a proven
+        read query; it is deliberately not exercised here.  Discovery also
+        never clears, consumes, or deliberately probes the device error queue.
         """
         say = log or (lambda tag, msg: self.log(tag, msg))
         if not self.is_open:
             raise RuntimeError(f"{self.name} is not connected.")
         report = {"idn": "", "adopted": {}, "failed": [], "verified": False,
-                  "error_queue": False, "tried": []}
+                  "error_queue": False, "tried": [], "read_only": True,
+                  "write_inferred": False, "write_command": ""}
 
         with self.lock:
             report["idn"] = self.idn or self.link.query("*IDN?")
             say("INFO", f"{self.name} identifies as: "
                         f"{report['idn'] or '(no reply)'}")
+            say("INFO", "Read-only check / discover is active: only safe "
+                        "device queries will be sent. The set point, control "
+                        "state, password, and error queue will not be written, "
+                        "cleared, or inspected.")
 
-            use_errors = self._has_error_queue()
-            report["error_queue"] = use_errors
-            say("INFO", "Error queue works - each command will be confirmed "
-                        "with SYSTem:ERRor?."
-                        if use_errors else
-                        "No usable error queue; judging commands by their "
-                        "replies alone.")
-
-            fam = FAMILIES.get(self.profile.get("family") or "unknown", {})
+            family_name = self.profile.get("family") or "unknown"
+            fam = FAMILIES.get(family_name, {})
             fam_cmds = fam.get("commands") or {}
+            broad_discovery = family_name in ("generic_scpi", "unknown")
+            if broad_discovery:
+                report["may_log_rejected_queries"] = True
+                say("WARN", "This profile has no authoritative command set. "
+                            "Only query forms will be sent, but the instrument "
+                            "may record unsupported queries as diagnostic "
+                            "errors; the suite will not clear or consume them.")
 
             def order(key, generic):
                 seen, out = set(), []
-                for cmd in ([self._cmd(key), fam_cmds.get(key)]
-                            + list(generic)):
+                if broad_discovery:
+                    choices = [self._cmd(key)]
+                    choices += list(generic)
+                else:
+                    choices = [fam_cmds.get(key)]
+                for cmd in choices:
                     if cmd and cmd not in seen:
                         seen.add(cmd)
                         out.append(cmd)
@@ -541,159 +635,116 @@ class HeatSource:
 
             def try_candidates(label, candidates, parser):
                 for cmd in candidates:
-                    accepted, reply = self._accepted(cmd, use_errors)
+                    accepted, reply = self._query_candidate(cmd)
                     report["tried"].append((label, cmd, reply))
                     value = parser(reply) if reply else None
                     if accepted and value is not None and value != "":
                         say("PASS", f"{label}: {cmd!r} works (reply {reply!r})")
-                        return cmd, value
+                        return cmd, value, reply
                     say("INFO", f"{label}: {cmd!r} - no")
                 say("FAIL", f"{label}: nothing worked.")
                 report["failed"].append(label)
-                return None, None
+                return None, None, ""
 
-            sp_read, original = try_candidates(
+            sp_read, original, sp_reply = try_candidates(
                 "Set-point read", order("sp_read", SP_READ_CANDIDATES),
                 first_float)
             if sp_read:
                 report["adopted"]["sp_read"] = sp_read
-                self._capture_unit(self.link.query(sp_read))
+                self._capture_unit(sp_reply)
                 if self.unit_token:
                     report["unit_token"] = self.unit_token
                     say("INFO", f"The set point is reported with a unit "
                                 f"({describe_unit_token(self.unit_token)}), "
-                                "so the write may need it too.")
+                                "so an inferred Additel target write will "
+                                "retain that device-supplied unit token.")
 
-            value_cmd, _ = try_candidates(
+            value_cmd, _, _ = try_candidates(
                 "Value (block temperature)", order("value", VALUE_CANDIDATES),
                 first_float)
             if value_cmd:
                 report["adopted"]["value"] = value_cmd
 
-            unit_cmd, _ = try_candidates(
+            unit_cmd, _, _ = try_candidates(
                 "Unit read", order("unit", UNIT_CANDIDATES),
                 lambda r: (r or "").strip())
             if unit_cmd:
                 report["adopted"]["unit"] = unit_cmd
 
-            # Heat/cool control: probe the query form only, never actuate.
-            for query, (on_cmd, off_cmd) in CONTROL_PAIRS.items():
-                accepted, reply = self._accepted(query, use_errors)
-                report["tried"].append(("Output control", query, reply))
-                if accepted and reply:
-                    report["adopted"]["enable"] = on_cmd
-                    report["adopted"]["disable"] = off_cmd
-                    say("PASS", f"Output control: {query!r} answers {reply!r} "
-                                f"-> using {on_cmd!r} / {off_cmd!r}")
-                    break
+            status_queries = CONTROL_STATUS_CANDIDATES.get(family_name, ())
+            if status_queries:
+                for query in status_queries:
+                    accepted, reply = self._query_candidate(query)
+                    report["tried"].append(("Control status", query, reply))
+                    if accepted and reply:
+                        report["control_status_query"] = query
+                        report["control_status_reply"] = reply
+                        say("PASS", f"Control status: {query!r} answers "
+                                    f"{reply!r}. This read does not imply or "
+                                    "send an enable/disable command.")
+                        break
+                else:
+                    say("INFO", "No read-only control-status query answered. "
+                                "No control command was inferred or sent.")
+            elif broad_discovery:
+                for query, (on_cmd, off_cmd) in CONTROL_PAIRS.items():
+                    accepted, reply = self._query_candidate(query)
+                    report["tried"].append(("Output control", query, reply))
+                    if accepted and reply:
+                        report["adopted"]["enable"] = on_cmd
+                        report["adopted"]["disable"] = off_cmd
+                        say("PASS", f"Output control: read-only query "
+                                    f"{query!r} answers {reply!r}; inferred "
+                                    f"{on_cmd!r} / {off_cmd!r}, neither sent.")
+                        break
+                else:
+                    say("INFO", "No read-only output-status query answered. "
+                                "No output command was inferred or sent.")
             else:
-                say("WARN", "No remote heat/cool control command found. "
-                            "Switch the output on at the front panel, or the "
-                            "instrument will not drive to its set points.")
+                say("INFO", "No control-status query is defined for this "
+                            "instrument family; none was sent.")
 
-            for cmd in STABLE_CANDIDATES:
-                accepted, reply = self._accepted(cmd, use_errors)
+            stability_candidates = STABLE_CANDIDATES if broad_discovery else ()
+            for cmd in stability_candidates:
+                accepted, reply = self._query_candidate(cmd)
+                report["tried"].append(("Stability", cmd, reply))
                 if accepted and reply:
                     say("INFO", f"Instrument also reports its own stability "
                                 f"via {cmd!r} ({reply!r}). The suite still "
                                 "judges stability from the reference probe.")
                     break
 
-            # Set-point write: only meaningful if we can read it back.
+            # Pair a proven read with a known write template, but do not send
+            # it. The first run both sends and immediately reads it back.
             if sp_read and original is not None:
-                write = (self._cmd("sp_write") or fam_cmds.get("sp_write")
-                         or WRITE_PAIRS.get(sp_read))
+                stored_write = self._cmd("sp_write")
+                family_write = fam_cmds.get("sp_write") or ""
+                paired_write = self._paired_setpoint_write(sp_read)
+                write = stored_write or family_write or paired_write
                 if not write:
                     say("FAIL", f"Set-point write: no known pairing for "
                                 f"{sp_read!r}; enter it by hand.")
                     report["failed"].append("Set-point write")
                 else:
-                    lo, hi = self.range
-                    target = original + test_delta
-                    if lo is not None and not (lo <= target <= hi):
-                        target = original - test_delta
-                    if lo is not None and not (lo <= target <= hi):
-                        target = original
-                    if abs(target - original) < 1e-9:
-                        say("WARN", "Range too tight to test a set-point "
-                                    "change; write command not verified.")
-                        report["adopted"]["sp_write"] = write
+                    inferred = not stored_write and not family_write
+                    report["adopted"]["sp_write"] = write
+                    report["write_command"] = write
+                    report["write_inferred"] = inferred
+                    if inferred:
+                        say("INFO", f"Set-point write: inferred {write!r} "
+                                    f"from {sp_read!r}. It was not sent; the "
+                                    f"device target remains {original:g}.")
                     else:
-                        # Some instruments want the unit alongside the value.
-                        # Try both shapes, preferring the one the set-point
-                        # read implies.
-                        plain = write.replace(",{unit}", "")
-                        with_unit = (plain if "{unit}" in plain
-                                     else plain + ",{unit}")
-                        variants = ([with_unit, plain] if self.unit_token
-                                    else [plain, with_unit])
-                        good, chosen, rb = False, None, None
-                        for variant in variants:
-                            try:
-                                command = self.format_setpoint_command(
-                                    variant, target)
-                            except RuntimeError:
-                                continue
-                            self._accepted(command, use_errors,
-                                           expect_reply=False)
-                            time.sleep(0.4)
-                            rb = first_float(
-                                self._capture_unit(self.link.query(sp_read)))
-                            if rb is not None and abs(rb - target) <= 0.05:
-                                good, chosen = True, variant
-                                break
-                            say("INFO", f"Set-point write: {variant!r} did "
-                                        f"not take (read back {rb}).")
-                        write = chosen or write
-                        if good:
-                            extra = ("  It needs the unit, supplied "
-                                     "automatically from the instrument's own "
-                                     "reply." if "{unit}" in write else "")
-                            say("PASS", f"Set-point write: {write!r} verified "
-                                        f"(wrote {target:.2f}, read {rb})."
-                                        + extra)
-                            report["adopted"]["sp_write"] = write
-                            report["verified"] = True
-                        elif rb is None:
-                            # No reply at all: distinguish a dropped link
-                            # from a rejected command before blaming a lock.
-                            alive = bool(self.link.query("*IDN?"))
-                            if alive:
-                                say("FAIL", f"Set-point write: wrote "
-                                            f"{target:.2f} but the set point "
-                                            "could not be read back. The "
-                                            "command may have been rejected.")
-                            else:
-                                say("FAIL", "The instrument stopped "
-                                            "responding during the set-point "
-                                            "test - the connection dropped. "
-                                            "Reconnect and try again; nothing "
-                                            "here says the command is wrong.")
-                                report["link_lost"] = True
-                            report["failed"].append("Set-point write")
-                            report["adopted"]["sp_write"] = write
-                        else:
-                            say("FAIL", f"Set-point write: wrote "
-                                        f"{target:.2f} but read back {rb}. "
-                                        "The set point may be locked on the "
-                                        "instrument.")
-                            report["failed"].append("Set-point write")
-                            report["adopted"]["sp_write"] = write
-                        if restore:
-                            try:
-                                self.link.write(
-                                    self.format_setpoint_command(write,
-                                                                 original))
-                                time.sleep(0.3)
-                                say("INFO", f"Set point restored to "
-                                            f"{original:g}.")
-                            except RuntimeError as exc:
-                                say("WARN", f"Could not restore the set "
-                                            f"point: {exc}")
+                        say("INFO", f"Set-point write: retained {write!r} as "
+                                    "a candidate. It was not sent or verified; "
+                                    f"the device target remains {original:g}.")
 
         self.profile.update(report["adopted"])
-        self.profile["verified"] = report["verified"]
+        # Query-only discovery cannot verify any command that changes state.
+        self.profile["verified"] = False
         if not report["failed"]:
-            say("PASS", f"{self.name}: all commands verified on the "
-                        "instrument.")
+            say("PASS", f"{self.name}: read-only check / discover complete. "
+                        "No set point or control state was changed; the write "
+                        "candidate remains unverified until a run commands "
+                        "and reads back its first requested point.")
         return report

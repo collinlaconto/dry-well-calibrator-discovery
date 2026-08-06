@@ -20,7 +20,8 @@ Commands used (from Additel's published ADT286 command set):
     SYSTem:ERRor?                  error queue
 
 Reply format for SCAN:DATA:Last? (per channel, groups split by ';'):
-    name, elecUnitId, n, <2n electrical values>, indUnitId, m, <m values>[, CJC...]
+    name, elecUnitId, n, [device time], <2n electrical values>,
+    indUnitId, m, <m values>[, CJC...]
 e.g. "REF1,1281,1,28.258167,28.258167,1001,1,33.512077;"
 """
 
@@ -46,9 +47,10 @@ CHANNEL_TYPES = {
 }
 
 SCAN_RATES = ("100", "1000", "4000")
-DRIVER_REVISION = "ADT286-2026.08.06.2-timestamp-optional"
+DRIVER_REVISION = "ADT286-2026.08.06.3-hyphen-timestamp"
 DEVICE_TIME_RE = re.compile(
-    r"\d{4}:\d{2}:\d{2}\s+\d{2}:\d{2}:\d{2}(?:[ .:]\d{1,9})?")
+    r"(?:\d{4}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2})"
+    r"\s+\d{2}:\d{2}:\d{2}(?:[ .:]\d{1,9})?")
 
 
 @dataclass(frozen=True)
