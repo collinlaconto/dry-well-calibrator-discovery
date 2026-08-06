@@ -14,7 +14,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, scrolledtext
 
 from . import datasync, export, theme
-from .adt286 import Adt286
+from .adt286 import Adt286, DRIVER_REVISION
 from .engine import (ChannelRegistry, RunEngine, default_profile,
                      tolerance_at, validate_profile, STATE_RUNNING)
 from .formats import KNOWN_MODELS, profile_for_model
@@ -25,6 +25,7 @@ from .transport import (CANDIDATE_TCP_PORTS, DEFAULT_TCP_PORT,
                         normalize_target, target_is_set)
 
 APP_TITLE = "Calibration Automation Suite"
+APP_BUILD = "2026.08.06.2"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Profile libraries live beside run_calibration_suite.py. That is HERE's
 # parent when the modules are in a calsuite/ folder, and HERE itself when
@@ -36,6 +37,20 @@ RUN_LIB = os.path.join(DATA_DIR, "calibration_profiles.json")
 
 PLOT_COLOURS = ["#0b5cad", "#b8500a", "#1a7f37", "#7a2fa8", "#b00020",
                 "#0f766e", "#8a6d00", "#4b5563"]
+
+
+def is_query_command(command):
+    """Return whether the SCPI command header is a read-only query.
+
+    Parameters follow the header, so ``SCAN:DATA:Last? 1`` is a query even
+    though the full command string does not end with ``?``.
+    """
+    exact = str(command or "").strip()
+    # Never let SCPI command chaining smuggle a write behind a query header.
+    if any(separator in exact for separator in (";", "\r", "\n")):
+        return False
+    head = exact.split(None, 1)[0]
+    return head.endswith("?")
 
 
 
@@ -309,7 +324,7 @@ class PlotCanvas(tk.Canvas):
 class SuiteApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(APP_TITLE)
+        self.title(f"{APP_TITLE} - build {APP_BUILD}")
         self.geometry("1280x860")
         self.minsize(1100, 740)
         self.fonts = theme.apply(self)
@@ -327,6 +342,15 @@ class SuiteApp(tk.Tk):
         self.history_cycles = {}
 
         self._build_ui()
+        self._log(
+            "INFO", f"Calibration Suite build {APP_BUILD}; "
+            f"driver {DRIVER_REVISION}; loaded from {HERE}")
+        if ("downloads" in HERE.lower()
+                and os.path.basename(HERE).lower().startswith("files (")):
+            self._log(
+                "WARN", "This copy is running from a generic Downloads "
+                "folder. Confirm the build line above before testing; older "
+                "folders with the same launcher name remain runnable.")
         self._refresh_ports()
         self._refresh_run_list()
         self._refresh_source_table()
@@ -1479,12 +1503,13 @@ class SuiteApp(tk.Tk):
         cmd = self.var_term_cmd.get().strip()
         if not cmd:
             return
-        is_query = cmd.rstrip().endswith("?")
+        is_query = is_query_command(cmd)
         if not is_query and not self.var_term_writes.get():
             messagebox.showerror(
                 "Query-only terminal",
                 "Device-changing commands are blocked by default. Use a read "
-                "query ending in '?', or explicitly enable Service mode.")
+                "query whose command header ends in '?', or explicitly enable "
+                "Service mode.")
             return
         self._refresh_terminal_targets()
         link, lock, name = self._term_link()

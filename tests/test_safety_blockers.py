@@ -74,6 +74,33 @@ class SequenceLink:
 
 
 class DeviceTimestampTests(unittest.TestCase):
+    def test_first_frame_diagnostic_is_exact_and_emitted_once(self):
+        messages = []
+        payload = (
+            scan_group("REF", "20.000000000000000001") + ";"
+            + scan_group("DUT", "20.100000000000000001")
+        )
+        link = SequenceLink([payload, payload])
+        adt = Adt286(
+            logger=lambda tag, message: messages.append((tag, message)))
+        adt.link = link
+        adt._subs = {"run": ["REF", "DUT"]}
+
+        adt._last_poll_started = -1e9
+        self.assertEqual(adt.poll_once(), 2)
+        adt._last_poll_started = -1e9
+        self.assertEqual(adt.poll_once(), 2)
+
+        exact = [message for tag, message in messages
+                 if tag == "RX" and "exact first parser input" in message]
+        parsed = [message for tag, message in messages
+                  if tag == "INFO" and "first scan parse" in message]
+        self.assertEqual(len(exact), 1)
+        self.assertIn(repr(payload), exact[0])
+        self.assertEqual(len(parsed), 1)
+        self.assertIn("raw_temperature='20.000000000000000001'", parsed[0])
+        self.assertIn("device_time=absent, usable", parsed[0])
+
     def test_format_one_timestamp_is_retained_before_or_after_scan_fields(self):
         stamp = "2026:08:05 17:04:03 123"
 

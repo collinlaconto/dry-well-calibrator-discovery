@@ -46,6 +46,7 @@ CHANNEL_TYPES = {
 }
 
 SCAN_RATES = ("100", "1000", "4000")
+DRIVER_REVISION = "ADT286-2026.08.06.2-timestamp-optional"
 DEVICE_TIME_RE = re.compile(
     r"\d{4}:\d{2}:\d{2}\s+\d{2}:\d{2}:\d{2}(?:[ .:]\d{1,9})?")
 
@@ -267,6 +268,9 @@ class Adt286:
         self._last_poll_started = 0.0
         self._last_device_times = {}
         self.freshness_supported = None
+        # Record exactly one diagnostic frame for each requested channel set.
+        # This is logging only: it never changes, substitutes, or rounds data.
+        self._traced_scan_signatures = set()
 
     # ------------------------------------------------------------ session --
     @property
@@ -330,6 +334,7 @@ class Adt286:
             self._readings.clear()
             self._last_device_times.clear()
             self.freshness_supported = None
+            self._traced_scan_signatures.clear()
         self.log("INFO", "ADT286 disconnected.")
 
     # ----------------------------------------------------------- channels --
@@ -506,7 +511,33 @@ class Adt286:
                 self.last_error = str(e)
                 self._note_bad_poll("the connection returned an error")
                 return 0
+            signature = tuple(requested)
+            trace_frame = bool(payload) and (
+                signature not in self._traced_scan_signatures)
+            if trace_frame:
+                self.log(
+                    "RX", f"ADT286 exact first parser input "
+                    f"[{DRIVER_REVISION}]: {payload!r}")
             data = parse_scan_data(payload)
+            if trace_frame:
+                parsed = []
+                for channel in requested:
+                    values = data.get(channel)
+                    if values is None:
+                        parsed.append(f"{channel}: missing")
+                        continue
+                    state = ("usable" if values.get("temperature") is not None
+                             else "unusable")
+                    device_time = ("present" if
+                                   values.get("device_timestamp") else "absent")
+                    parsed.append(
+                        f"{channel}: raw_temperature="
+                        f"{values.get('raw_temperature', '')!r}, "
+                        f"unit={values.get('unit')!r}, "
+                        f"device_time={device_time}, {state}")
+                self.log("INFO", "ADT286 first scan parse: "
+                         + "; ".join(parsed))
+                self._traced_scan_signatures.add(signature)
             if not data:
                 self._note_bad_poll("no readings came back")
                 return 0

@@ -8,6 +8,7 @@ bootstrap_calsuite()
 from calsuite.formats import ERROR_QUERY, NONSENSE_COMMAND
 from calsuite.heatsource import HeatSource, checked_exchange
 from calsuite.transport import Link
+from calsuite.ui import is_query_command
 
 
 class ChunkTransport:
@@ -76,6 +77,20 @@ class LinkFramingTests(unittest.TestCase):
 
         with self.assertRaises(TimeoutError):
             link.query("SCAN:DATA:Last? 1")
+
+
+class TerminalQueryClassificationTests(unittest.TestCase):
+    def test_parameterized_scpi_query_is_read_only(self):
+        self.assertTrue(is_query_command("SCAN:DATA:Last? 1"))
+        self.assertTrue(is_query_command('CHANnel:CONFig? "REF1"'))
+        self.assertTrue(is_query_command("SYSTem:ERRor?"))
+
+    def test_device_changing_command_is_not_query(self):
+        self.assertFalse(is_query_command(
+            'SCAN:MULT:STARt 1000,"REF1,CH1-01A"'))
+        self.assertFalse(is_query_command("SCAN:STOP"))
+        self.assertFalse(is_query_command("SCAN:DATA:Last? 1;SCAN:STOP"))
+        self.assertFalse(is_query_command("SCAN:DATA:Last?\nSCAN:STOP"))
 
 
 class QueueLink:

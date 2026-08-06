@@ -77,6 +77,13 @@ The launcher works whether the modules sit flat beside it or in a `calsuite/`
 subfolder. If a file is missing it says which in a dialog box, rather than
 failing silently behind a hidden console.
 
+The window title and first Activity entry show the build identifier and the
+folder actually loaded. This matters when several downloaded folders contain
+the same launcher name. The first non-empty ADT286 parser input for each
+channel set is also copied exactly once into Activity with a parse summary,
+making a firmware-format problem diagnosable without changing any device
+value.
+
 Two files are created next to the launcher and grow as you work:
 
 | File | Holds |
